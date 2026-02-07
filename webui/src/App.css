@@ -7,14 +7,19 @@
 
 body {
   margin: 0;
+  padding: 0;
+  display: block; /* Remove display: flex which centers everything */
   background: #0b0f14;
   color: rgba(255, 255, 255, 0.92);
+  min-width: unset;
+  min-height: auto;
 }
 
 #root {
   max-width: 1100px;
   margin: 0 auto;
   padding: 16px;
+  text-align: left; /* Ensure text is left-aligned */
 }
 
 label {
