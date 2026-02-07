@@ -25,6 +25,15 @@ const API_KEY = process.env.AGENT_MESH_API_KEY || 'openclaw-mesh-default-key';
 app.use(cors());
 app.use(express.json());
 
+// Optional: Serve the Web UI build (webui/dist)
+// This is convenience for LAN/Tailscale usage.
+try {
+  const webuiDist = join(__dirname, 'webui', 'dist');
+  app.use('/', express.static(webuiDist));
+} catch (e) {
+  // ignore
+}
+
 // Initialize SQLite
 let db;
 async function initDb() {
