@@ -1,0 +1,6 @@
+node_modules/
+agent-mesh.db
+*.log
+webui/node_modules/
+webui/dist/
+.DS_Store
