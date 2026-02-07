@@ -1,0 +1,10 @@
+{
+  "meshServerUrl": "http://localhost:4000",
+  "apiKey": "openclaw-mesh-default-key",
+  "agentName": "MyOpenClawAgent",
+  "agentEndpoint": "http://localhost:3000",
+  "capabilities": ["messaging", "task_execution"],
+  "autoRegister": true,
+  "heartbeatInterval": 30000,
+  "messageCheckInterval": 60000
+}
