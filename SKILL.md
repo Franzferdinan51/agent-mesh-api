@@ -285,6 +285,89 @@ Regularly check for messages using mesh_get_messages. When you receive a message
 respond helpfully and mark it as read.
 ```
 
+## Developing Custom Skills
+
+When creating custom skills for the Agent Mesh, follow the standardized protocol:
+
+1. **Read the Skill Protocol**: See [SKILL_PROTOCOL.md](./SKILL_PROTOCOL.md) for the complete integration specification
+2. **Use the Template**: See [SKILL_TEMPLATE.md](./SKILL_TEMPLATE.md) for a ready-to-use skill template
+3. **Follow Naming Conventions**: Use `category_action` format (e.g., `web_search`, `data_analyze`)
+4. **Standardize Responses**: All skills should return `{success, result, error, metadata}` format
+5. **Handle Errors**: Use standard error codes defined in the protocol
+
+### Quick Skill Development Checklist
+
+- [ ] Review [SKILL_PROTOCOL.md](./SKILL_PROTOCOL.md)
+- [ ] Copy [SKILL_TEMPLATE.md](./SKILL_TEMPLATE.md) and customize
+- [ ] Define input/output schemas
+- [ ] Implement error handling with standard codes
+- [ ] Add metadata (version, processing time)
+- [ ] Test locally before registering
+- [ ] Register with mesh using `mesh_register_skill`
+- [ ] Document usage examples
+
+### Skill Categories
+
+Use these prefixes when naming skills:
+- `web_` - Web operations (scraping, search)
+- `data_` - Data processing and analysis
+- `file_` - File operations
+- `ai_` - AI/ML model operations
+- `comms_` - Communication protocols
+- `dev_` - Development tools
+- `sys_` - System operations
+
+Example: `web_search`, `data_analyze`, `file_convert`
+
+### Example: Creating a Simple Skill
+
+```javascript
+// 1. Define your skill endpoint
+app.post('/skills/my_skill', async (req, res) => {
+  const startTime = Date.now();
+
+  try {
+    // Validate input
+    if (!req.body.query) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'INVALID_PARAMETER', message: 'query is required' },
+        metadata: { skillName: 'my_skill', version: '1.0.0', processingTimeMs: Date.now() - startTime }
+      });
+    }
+
+    // Execute skill logic
+    const result = await performMySkill(req.body.query);
+
+    // Return standardized response
+    res.json({
+      success: true,
+      result,
+      error: null,
+      metadata: {
+        skillName: 'my_skill',
+        version: '1.0.0',
+        processingTimeMs: Date.now() - startTime,
+        timestamp: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: { code: 'INTERNAL_ERROR', message: error.message },
+      metadata: { skillName: 'my_skill', version: '1.0.0', processingTimeMs: Date.now() - startTime }
+    });
+  }
+});
+
+// 2. Register with mesh
+await mesh_register_skill({
+  name: 'my_skill',
+  description: 'Description of what this skill does',
+  endpoint: 'http://my-agent:3000/skills/my_skill'
+});
+```
+
 ## Troubleshooting
 
 ### Connection refused

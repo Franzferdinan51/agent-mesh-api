@@ -2,6 +2,15 @@
 
 Agent-to-Agent Communication API for OpenClaw. Enables multiple AI agents to discover each other, send messages, share capabilities, and collaborate.
 
+## Documentation
+
+- **[Quick Start Guide](#quick-start)** - Get the mesh running
+- **[API Reference](#api-endpoints)** - All available endpoints
+- **[Agent Connection Guide](#agent-connection-guide)** - How agents connect
+- **[Skill Development Guide](#skill-development)** - Create and register skills
+- **[Skill Protocol](./SKILL_PROTOCOL.md)** - Standardized integration protocol
+- **[Skill Template](./SKILL_TEMPLATE.md)** - Ready-to-use skill template
+
 ## Features
 
 - **Agent Registry** - Agents register with name, endpoint, and capabilities
@@ -351,6 +360,90 @@ ws.onmessage = (event) => {
                         └─────────────────┘
 ```
 
+## Skill Development
+
+### Creating Custom Skills
+
+The Agent Mesh uses a standardized protocol for skill integration. Follow these steps to create and register your own skills:
+
+1. **Read the Protocol**
+   - See [SKILL_PROTOCOL.md](./SKILL_PROTOCOL.md) for the complete integration specification
+   - Covers registration, invocation, message formats, error handling, and best practices
+
+2. **Use the Template**
+   - Copy [SKILL_TEMPLATE.md](./SKILL_TEMPLATE.md) to create new skills
+   - Includes input/output schemas, error handling, and code examples in Node.js and Python
+
+3. **Follow Naming Conventions**
+   ```
+   Format: category_action
+   Examples: web_search, data_analyze, file_convert, ai_generate
+   ```
+
+4. **Implement Standard Response Format**
+   ```json
+   {
+     "success": true|false,
+     "result": { /* your data */ },
+     "error": { /* error details if failed */ },
+     "metadata": {
+       "skillName": "your_skill_name",
+       "version": "1.0.0",
+       "processingTimeMs": 150,
+       "timestamp": "2024-01-15T10:30:00Z"
+     }
+   }
+   ```
+
+5. **Register Your Skill**
+   ```bash
+   curl -X POST http://localhost:4000/api/skills \
+     -H "Content-Type: application/json" \
+     -H "X-API-Key: openclaw-mesh-default-key" \
+     -d '{
+       "agentId": "your-agent-id",
+       "name": "your_skill_name",
+       "description": "What your skill does",
+       "endpoint": "http://your-agent:3000/skills/your_skill"
+     }'
+   ```
+
+### Skill Discovery
+
+Find skills available from other agents:
+
+```bash
+curl http://localhost:4000/api/skills \
+  -H "X-API-Key: openclaw-mesh-default-key"
+```
+
+### Skill Invocation
+
+Invoke a skill on another agent:
+
+```bash
+curl -X POST http://localhost:4000/api/skills/{skillId}/invoke \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: openclaw-mesh-default-key" \
+  -d '{
+    "from": "your-agent-id",
+    "payload": { "param1": "value1" }
+  }'
+```
+
+### Example Skills
+
+See the [examples/](./examples/) directory for complete skill implementations:
+
+- **web_search** - Web search integration
+- **data_process** - Data processing example
+- **file_operations** - File handling example
+
+For more details, see:
+- [Skill Protocol Specification](./SKILL_PROTOCOL.md)
+- [Skill Registration Template](./SKILL_TEMPLATE.md)
+- [OpenClaw Skill Integration](./SKILL.md)
+
 ## Roadmap
 
 - [ ] Federation support (connect multiple mesh instances)
@@ -358,6 +451,8 @@ ws.onmessage = (event) => {
 - [ ] Agent groups/channels
 - [ ] Message persistence TTL
 - [ ] REST webhook callbacks
+- [ ] Skill versioning and migrations
+- [ ] Skill marketplace/discovery UI
 
 ## License
 

@@ -68,11 +68,38 @@ export const mesh = {
   listMessages: (agentId: string, unreadOnly = false) =>
     api<MeshMessage[]>(`/api/messages/${encodeURIComponent(agentId)}${unreadOnly ? '?unreadOnly=true' : ''}`),
   sendMessage: (body: { from: string; to: string; content: string }) =>
-    api<any>('/api/messages', { method: 'POST', body: JSON.stringify(body) }),
+    api<unknown>('/api/messages', { method: 'POST', body: JSON.stringify(body) }),
   broadcast: (body: { from: string; content: string }) =>
-    api<any>('/api/broadcast', { method: 'POST', body: JSON.stringify(body) }),
+    api<unknown>('/api/broadcast', { method: 'POST', body: JSON.stringify(body) }),
 
   listSkills: () => api<Skill[]>('/api/skills'),
   registerSkill: (body: { agentId: string; name: string; description?: string; endpoint: string }) =>
-    api<any>('/api/skills', { method: 'POST', body: JSON.stringify(body) }),
+    api<unknown>('/api/skills', { method: 'POST', body: JSON.stringify(body) }),
 };
+
+// Helper function to determine if agent is online based on last_seen
+export function isAgentOnline(lastSeen?: string): boolean {
+  if (!lastSeen) return false;
+  const lastSeenTime = new Date(lastSeen).getTime();
+  const now = Date.now();
+  const fiveMinutesAgo = now - 5 * 60 * 1000;
+  return lastSeenTime > fiveMinutesAgo;
+}
+
+// Helper function to format relative time
+export function formatRelativeTime(timestamp?: string): string {
+  if (!timestamp) return 'never';
+  const time = new Date(timestamp).getTime();
+  const now = Date.now();
+  const diff = now - time;
+
+  const seconds = Math.floor(diff / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+
+  if (seconds < 60) return 'just now';
+  if (minutes < 60) return `${minutes}m ago`;
+  if (hours < 24) return `${hours}h ago`;
+  return `${days}d ago`;
+}
