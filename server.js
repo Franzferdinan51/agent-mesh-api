@@ -37,21 +37,32 @@ try {
 // Initialize SQLite
 let db;
 async function initDb() {
+  const dbPath = join(__dirname, 'agent-mesh.db');
+
   db = await open({
-    filename: join(__dirname, 'agent-mesh.db'),
+    filename: dbPath,
     driver: sqlite3.Database
   });
-  
+
+  // Enable WAL mode for better durability and concurrency
+  await db.exec('PRAGMA journal_mode = WAL;');
+  await db.exec('PRAGMA synchronous = NORMAL;');
+  await db.exec('PRAGMA busy_timeout = 5000;');
+  await db.exec('PRAGMA foreign_keys = ON;');
+
+  console.log(`[DB] SQLite initialized: ${dbPath}`);
+  console.log('[DB] Durability settings: WAL mode, NORMAL sync, 5s timeout');
+
   await db.exec(`
     CREATE TABLE IF NOT EXISTS agents (
       id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
+      name TEXT NOT NULL UNIQUE,
       endpoint TEXT,
       capabilities TEXT,
       last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
-    
+
     CREATE TABLE IF NOT EXISTS messages (
       id TEXT PRIMARY KEY,
       from_agent TEXT NOT NULL,
@@ -59,9 +70,11 @@ async function initDb() {
       content TEXT NOT NULL,
       message_type TEXT DEFAULT 'direct',
       read BOOLEAN DEFAULT 0,
+      status TEXT DEFAULT 'pending',
+      timeout_ms INTEGER,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
-    
+
     CREATE TABLE IF NOT EXISTS skills (
       id TEXT PRIMARY KEY,
       agent_id TEXT NOT NULL,
@@ -70,17 +83,77 @@ async function initDb() {
       endpoint TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS agent_groups (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT,
+      metadata TEXT,
+      created_by TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS agent_group_members (
+      group_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      role TEXT DEFAULT 'member',
+      joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (group_id, agent_id),
+      FOREIGN KEY (group_id) REFERENCES agent_groups(id) ON DELETE CASCADE,
+      FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS collective_memory (
+      id TEXT PRIMARY KEY,
+      group_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      value TEXT NOT NULL,
+      memory_type TEXT DEFAULT 'shared',
+      version INTEGER DEFAULT 1,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (group_id) REFERENCES agent_groups(id) ON DELETE CASCADE,
+      FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_messages_to_agent ON messages(to_agent);
+    CREATE INDEX IF NOT EXISTS idx_messages_status ON messages(status);
+    CREATE INDEX IF NOT EXISTS idx_agent_groups_group ON agent_group_members(group_id);
+    CREATE INDEX IF NOT EXISTS idx_collective_memory_group ON collective_memory(group_id);
+    CREATE INDEX IF NOT EXISTS idx_collective_memory_key ON collective_memory(group_id, key);
   `);
-  
-  console.log('[DB] SQLite initialized');
+
+  // Verify database is writable
+  try {
+    await db.run('SELECT COUNT(*) FROM agents');
+    console.log('[DB] Database verified and writable');
+  } catch (error) {
+    console.error('[DB] ERROR: Database is not writable!', error);
+    throw error;
+  }
 }
 
 // Auth middleware
 function requireApiKey(req, res, next) {
-  const key = req.headers['x-api-key'] || req.query.apiKey;
-  if (key !== API_KEY) {
-    return res.status(401).json({ error: 'Invalid or missing API key' });
+  // Try multiple sources for the API key (header, query param, Authorization Bearer token)
+  let key = req.headers['x-api-key'] || req.query.apiKey;
+
+  // Also support Authorization: Bearer <token> header
+  const authHeader = req.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    key = authHeader.substring(7);
   }
+
+  // Trim whitespace and validate
+  if (!key || key.trim() !== API_KEY) {
+    return res.status(401).json({
+      error: 'Invalid or missing API key',
+      expected: API_KEY,
+      received: key ? `${key.substring(0, 3)}...` : 'none'
+    });
+  }
+
   next();
 }
 
@@ -90,28 +163,56 @@ function requireApiKey(req, res, next) {
 app.post('/api/agents/register', requireApiKey, async (req, res) => {
   try {
     const { name, endpoint, capabilities } = req.body;
-    
+
     if (!name) {
       return res.status(400).json({ error: 'Name is required' });
     }
-    
-    const id = uuidv4();
-    await db.run(
-      'INSERT INTO agents (id, name, endpoint, capabilities) VALUES (?, ?, ?, ?)',
-      [id, name, endpoint || null, JSON.stringify(capabilities || [])]
-    );
-    
-    // Broadcast to all connected WebSocket clients
-    broadcast({
-      type: 'agent_joined',
-      agent: { id, name, endpoint, capabilities }
-    });
-    
-    res.json({ 
-      success: true, 
-      agentId: id,
-      message: 'Agent registered successfully'
-    });
+
+    // Check if agent with this name already exists (Identity Persistence)
+    const existingAgent = await db.get('SELECT * FROM agents WHERE name = ?', name);
+
+    let id;
+    if (existingAgent) {
+      // Return existing agentId - don't create duplicate
+      id = existingAgent.id;
+
+      // Update endpoint and capabilities if provided
+      await db.run(
+        'UPDATE agents SET endpoint = ?, capabilities = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?',
+        [endpoint || existingAgent.endpoint, JSON.stringify(capabilities || []), id]
+      );
+
+      console.log(`[Registration] Agent "${name}" re-registered with existing ID: ${id}`);
+
+      res.json({
+        success: true,
+        agentId: id,
+        message: 'Agent re-registered with existing ID',
+        existed: true
+      });
+    } else {
+      // Create new agent
+      id = uuidv4();
+      await db.run(
+        'INSERT INTO agents (id, name, endpoint, capabilities) VALUES (?, ?, ?, ?)',
+        [id, name, endpoint || null, JSON.stringify(capabilities || [])]
+      );
+
+      console.log(`[Registration] New agent "${name}" registered with ID: ${id}`);
+
+      // Broadcast to all connected WebSocket clients
+      broadcast({
+        type: 'agent_joined',
+        agent: { id, name, endpoint, capabilities }
+      });
+
+      res.json({
+        success: true,
+        agentId: id,
+        message: 'Agent registered successfully',
+        existed: false
+      });
+    }
   } catch (error) {
     console.error('[Error] Register agent:', error);
     res.status(500).json({ error: error.message });
@@ -312,11 +413,11 @@ app.post('/api/skills/:id/invoke', requireApiKey, async (req, res) => {
   try {
     const { from, payload } = req.body;
     const skill = await db.get('SELECT * FROM skills WHERE id = ?', req.params.id);
-    
+
     if (!skill) {
       return res.status(404).json({ error: 'Skill not found' });
     }
-    
+
     // Send invocation as a message
     const messageId = uuidv4();
     const content = JSON.stringify({
@@ -324,12 +425,12 @@ app.post('/api/skills/:id/invoke', requireApiKey, async (req, res) => {
       skillName: skill.name,
       payload
     });
-    
+
     await db.run(
       'INSERT INTO messages (id, from_agent, to_agent, content, message_type) VALUES (?, ?, ?, ?, ?)',
       [messageId, from, skill.agent_id, content, 'skill_invocation']
     );
-    
+
     broadcast({
       type: 'skill_invoked',
       skillId: skill.id,
@@ -337,12 +438,587 @@ app.post('/api/skills/:id/invoke', requireApiKey, async (req, res) => {
       from,
       to: skill.agent_id
     });
-    
+
     res.json({ success: true, invocationId: messageId });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
+
+// === AGENT GROUPS ===
+
+// Create a new agent group
+app.post('/api/groups', requireApiKey, async (req, res) => {
+  try {
+    const { name, description, createdBy, metadata } = req.body;
+
+    if (!name || !createdBy) {
+      return res.status(400).json({ error: 'name and createdBy are required' });
+    }
+
+    const id = uuidv4();
+    await db.run(
+      'INSERT INTO agent_groups (id, name, description, metadata, created_by) VALUES (?, ?, ?, ?, ?)',
+      [id, name, description || null, JSON.stringify(metadata || {}), createdBy]
+    );
+
+    broadcast({
+      type: 'group_created',
+      group: { id, name, description, createdBy, metadata }
+    });
+
+    res.json({
+      success: true,
+      groupId: id,
+      message: 'Agent group created successfully'
+    });
+  } catch (error) {
+    console.error('[Error] Create group:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// List all agent groups
+app.get('/api/groups', requireApiKey, async (req, res) => {
+  try {
+    const groups = await db.all(`
+      SELECT g.*,
+        (SELECT COUNT(*) FROM agent_group_members WHERE group_id = g.id) as member_count
+      FROM agent_groups g
+      ORDER BY g.created_at DESC
+    `);
+
+    res.json(groups.map(g => ({
+      ...g,
+      metadata: JSON.parse(g.metadata || '{}')
+    })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get specific group details with members
+app.get('/api/groups/:id', requireApiKey, async (req, res) => {
+  try {
+    const group = await db.get('SELECT * FROM agent_groups WHERE id = ?', req.params.id);
+
+    if (!group) {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    const members = await db.all(`
+      SELECT agm.*, a.name, a.endpoint, a.capabilities, a.last_seen
+      FROM agent_group_members agm
+      JOIN agents a ON agm.agent_id = a.id
+      WHERE agm.group_id = ?
+      ORDER BY agm.joined_at ASC
+    `, req.params.id);
+
+    res.json({
+      ...group,
+      metadata: JSON.parse(group.metadata || '{}'),
+      members: members.map(m => ({
+        ...m,
+        capabilities: JSON.parse(m.capabilities || '[]')
+      }))
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Add agent to group
+app.post('/api/groups/:groupId/members', requireApiKey, async (req, res) => {
+  try {
+    const { agentId, role = 'member' } = req.body;
+
+    if (!agentId) {
+      return res.status(400).json({ error: 'agentId is required' });
+    }
+
+    // Verify group exists
+    const group = await db.get('SELECT id FROM agent_groups WHERE id = ?', req.params.groupId);
+    if (!group) {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    // Verify agent exists
+    const agent = await db.get('SELECT id FROM agents WHERE id = ?', agentId);
+    if (!agent) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+
+    // Check if already a member
+    const existing = await db.get(
+      'SELECT * FROM agent_group_members WHERE group_id = ? AND agent_id = ?',
+      [req.params.groupId, agentId]
+    );
+
+    if (existing) {
+      return res.status(409).json({ error: 'Agent is already a member of this group' });
+    }
+
+    await db.run(
+      'INSERT INTO agent_group_members (group_id, agent_id, role) VALUES (?, ?, ?)',
+      [req.params.groupId, agentId, role]
+    );
+
+    broadcast({
+      type: 'group_member_added',
+      groupId: req.params.groupId,
+      agentId,
+      role
+    });
+
+    res.json({
+      success: true,
+      message: 'Agent added to group successfully'
+    });
+  } catch (error) {
+    console.error('[Error] Add group member:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Remove agent from group
+app.delete('/api/groups/:groupId/members/:agentId', requireApiKey, async (req, res) => {
+  try {
+    const result = await db.run(
+      'DELETE FROM agent_group_members WHERE group_id = ? AND agent_id = ?',
+      [req.params.groupId, req.params.agentId]
+    );
+
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'Group member not found' });
+    }
+
+    broadcast({
+      type: 'group_member_removed',
+      groupId: req.params.groupId,
+      agentId: req.params.agentId
+    });
+
+    res.json({
+      success: true,
+      message: 'Agent removed from group successfully'
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Discover groups by agent
+app.get('/api/agents/:agentId/groups', requireApiKey, async (req, res) => {
+  try {
+    const groups = await db.all(`
+      SELECT g.*, agm.role
+      FROM agent_groups g
+      JOIN agent_group_members agm ON g.id = agm.group_id
+      WHERE agm.agent_id = ?
+      ORDER BY g.created_at DESC
+    `, req.params.agentId);
+
+    res.json(groups.map(g => ({
+      ...g,
+      metadata: JSON.parse(g.metadata || '{}')
+    })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Discover agents in a group (for targeting)
+app.get('/api/groups/:groupId/agents', requireApiKey, async (req, res) => {
+  try {
+    const agents = await db.all(`
+      SELECT a.*, agm.role
+      FROM agents a
+      JOIN agent_group_members agm ON a.id = agm.agent_id
+      WHERE agm.group_id = ?
+      ORDER BY a.name ASC
+    `, req.params.groupId);
+
+    res.json(agents.map(a => ({
+      ...a,
+      capabilities: JSON.parse(a.capabilities || '[]')
+    })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Send message to entire group
+app.post('/api/groups/:groupId/broadcast', requireApiKey, async (req, res) => {
+  try {
+    const { from, content, messageType = 'direct' } = req.body;
+
+    if (!from || !content) {
+      return res.status(400).json({ error: 'from and content are required' });
+    }
+
+    // Get all agents in group except sender
+    const agents = await db.all(`
+      SELECT agm.agent_id
+      FROM agent_group_members agm
+      WHERE agm.group_id = ? AND agm.agent_id != ?
+    `, [req.params.groupId, from]);
+
+    if (agents.length === 0) {
+      return res.status(404).json({ error: 'No agents found in group' });
+    }
+
+    const messageIds = [];
+    for (const agent of agents) {
+      const id = uuidv4();
+      await db.run(
+        'INSERT INTO messages (id, from_agent, to_agent, content, message_type, status) VALUES (?, ?, ?, ?, ?, ?)',
+        [id, from, agent.agent_id, content, messageType, 'delivered']
+      );
+      messageIds.push(id);
+    }
+
+    broadcast({
+      type: 'group_broadcast',
+      groupId: req.params.groupId,
+      from,
+      content,
+      recipientCount: agents.length
+    });
+
+    res.json({
+      success: true,
+      recipientCount: agents.length,
+      messageIds
+    });
+  } catch (error) {
+    console.error('[Error] Group broadcast:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// === COLLECTIVE MEMORY ===
+
+// Store shared memory in a group
+app.post('/api/groups/:groupId/memory', requireApiKey, async (req, res) => {
+  try {
+    const { agentId, key, value, memoryType = 'shared' } = req.body;
+
+    if (!agentId || !key || value === undefined) {
+      return res.status(400).json({ error: 'agentId, key, and value are required' });
+    }
+
+    // Verify group exists and agent is a member
+    const membership = await db.get(
+      'SELECT * FROM agent_group_members WHERE group_id = ? AND agent_id = ?',
+      [req.params.groupId, agentId]
+    );
+
+    if (!membership) {
+      return res.status(403).json({ error: 'Agent is not a member of this group' });
+    }
+
+    // Check if memory key already exists
+    const existing = await db.get(
+      'SELECT * FROM collective_memory WHERE group_id = ? AND key = ?',
+      [req.params.groupId, key]
+    );
+
+    let memoryId;
+    if (existing) {
+      // Update existing memory with version increment
+      memoryId = existing.id;
+      await db.run(
+        'UPDATE collective_memory SET value = ?, agent_id = ?, memory_type = ?, version = version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+        [JSON.stringify(value), agentId, memoryType, memoryId]
+      );
+    } else {
+      // Create new memory entry
+      memoryId = uuidv4();
+      await db.run(
+        'INSERT INTO collective_memory (id, group_id, agent_id, key, value, memory_type) VALUES (?, ?, ?, ?, ?, ?)',
+        [memoryId, req.params.groupId, agentId, key, JSON.stringify(value), memoryType]
+      );
+    }
+
+    broadcast({
+      type: 'memory_updated',
+      groupId: req.params.groupId,
+      memoryId,
+      key,
+      agentId
+    });
+
+    res.json({
+      success: true,
+      memoryId,
+      version: existing ? existing.version + 1 : 1
+    });
+  } catch (error) {
+    console.error('[Error] Store memory:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all memory keys for a group
+app.get('/api/groups/:groupId/memory', requireApiKey, async (req, res) => {
+  try {
+    const { keys, memoryType } = req.query;
+    let query = 'SELECT * FROM collective_memory WHERE group_id = ?';
+    const params = [req.params.groupId];
+
+    if (memoryType) {
+      query += ' AND memory_type = ?';
+      params.push(memoryType);
+    }
+
+    if (keys) {
+      const keyList = keys.split(',');
+      query += ` AND key IN (${keyList.map(() => '?').join(',')})`;
+      params.push(...keyList);
+    }
+
+    query += ' ORDER BY updated_at DESC';
+
+    const memories = await db.all(query, params);
+
+    res.json(memories.map(m => ({
+      ...m,
+      value: JSON.parse(m.value)
+    })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get specific memory key
+app.get('/api/groups/:groupId/memory/:key', requireApiKey, async (req, res) => {
+  try {
+    const memory = await db.get(
+      'SELECT * FROM collective_memory WHERE group_id = ? AND key = ?',
+      [req.params.groupId, req.params.key]
+    );
+
+    if (!memory) {
+      return res.status(404).json({ error: 'Memory key not found' });
+    }
+
+    res.json({
+      ...memory,
+      value: JSON.parse(memory.value)
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete memory key
+app.delete('/api/groups/:groupId/memory/:key', requireApiKey, async (req, res) => {
+  try {
+    const { agentId } = req.body;
+
+    if (!agentId) {
+      return res.status(400).json({ error: 'agentId is required' });
+    }
+
+    // Verify membership
+    const membership = await db.get(
+      'SELECT * FROM agent_group_members WHERE group_id = ? AND agent_id = ?',
+      [req.params.groupId, agentId]
+    );
+
+    if (!membership) {
+      return res.status(403).json({ error: 'Agent is not a member of this group' });
+    }
+
+    const result = await db.run(
+      'DELETE FROM collective_memory WHERE group_id = ? AND key = ?',
+      [req.params.groupId, req.params.key]
+    );
+
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'Memory key not found' });
+    }
+
+    broadcast({
+      type: 'memory_deleted',
+      groupId: req.params.groupId,
+      key: req.params.key,
+      agentId
+    });
+
+    res.json({
+      success: true,
+      message: 'Memory deleted successfully'
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get memory history (versions) for a key
+app.get('/api/groups/:groupId/memory/:key/history', requireApiKey, async (req, res) => {
+  try {
+    // For full version history, we'd need a separate version table
+    // For now, return current version info
+    const memory = await db.get(
+      'SELECT * FROM collective_memory WHERE group_id = ? AND key = ?',
+      [req.params.groupId, req.params.key]
+    );
+
+    if (!memory) {
+      return res.status(404).json({ error: 'Memory key not found' });
+    }
+
+    res.json({
+      key: memory.key,
+      currentVersion: memory.version,
+      lastUpdated: memory.updated_at,
+      lastUpdatedBy: memory.agent_id
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// === ENHANCED MESSAGING WITH TIMEOUT HANDLING ===
+
+// Update message status (for timeout handling)
+app.patch('/api/messages/:id/status', requireApiKey, async (req, res) => {
+  try {
+    const { status, error } = req.body;
+
+    if (!status) {
+      return res.status(400).json({ error: 'status is required' });
+    }
+
+    const validStatuses = ['pending', 'delivered', 'processing', 'completed', 'failed', 'timeout'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ error: `Invalid status. Must be one of: ${validStatuses.join(', ')}` });
+    }
+
+    const message = await db.get('SELECT * FROM messages WHERE id = ?', req.params.id);
+
+    if (!message) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
+
+    await db.run(
+      'UPDATE messages SET status = ? WHERE id = ?',
+      [status, req.params.id]
+    );
+
+    // If message failed or timed out, store error details
+    if (status === 'failed' || status === 'timeout') {
+      broadcast({
+        type: 'message_failed',
+        messageId: req.params.id,
+        status,
+        error: error || 'Message processing failed',
+        toAgent: message.to_agent
+      });
+    }
+
+    res.json({ success: true, status });
+  } catch (error) {
+    console.error('[Error] Update message status:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get failed/timeout messages for retry
+app.get('/api/messages/:agentId/failed', requireApiKey, async (req, res) => {
+  try {
+    const messages = await db.all(`
+      SELECT * FROM messages
+      WHERE to_agent = ? AND status IN ('failed', 'timeout')
+      ORDER BY created_at DESC
+      LIMIT 50
+    `, req.params.agentId);
+
+    res.json(messages);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Retry failed message
+app.post('/api/messages/:id/retry', requireApiKey, async (req, res) => {
+  try {
+    const message = await db.get('SELECT * FROM messages WHERE id = ?', req.params.id);
+
+    if (!message) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
+
+    if (message.status !== 'failed' && message.status !== 'timeout') {
+      return res.status(400).json({ error: 'Only failed or timeout messages can be retried' });
+    }
+
+    // Reset status to pending
+    await db.run(
+      'UPDATE messages SET status = ? WHERE id = ?',
+      ['pending', req.params.id]
+    );
+
+    broadcast({
+      type: 'message_retry',
+      messageId: req.params.id,
+      toAgent: message.to_agent
+    });
+
+    res.json({
+      success: true,
+      message: 'Message queued for retry'
+    });
+  } catch (error) {
+    console.error('[Error] Retry message:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// === TIMEOUT HANDLING UTILITIES ===
+
+// Check for timed out messages (runs periodically)
+const MESSAGE_TIMEOUT = parseInt(process.env.MESSAGE_TIMEOUT || '300000'); // 5 minutes default
+
+async function checkMessageTimeouts() {
+  try {
+    const timeoutDate = new Date(Date.now() - MESSAGE_TIMEOUT).toISOString();
+
+    const timedOutMessages = await db.all(`
+      SELECT * FROM messages
+      WHERE status IN ('pending', 'processing')
+      AND created_at < ?
+      AND timeout_ms IS NOT NULL
+    `, timeoutDate);
+
+    for (const msg of timedOutMessages) {
+      await db.run(
+        'UPDATE messages SET status = ? WHERE id = ?',
+        ['timeout', msg.id]
+      );
+
+      broadcast({
+        type: 'message_timeout',
+        messageId: msg.id,
+        toAgent: msg.to_agent,
+        fromAgent: msg.from_agent,
+        createdAt: msg.created_at
+      });
+
+      console.log(`[Timeout] Message ${msg.id} timed out for agent ${msg.to_agent}`);
+    }
+
+    if (timedOutMessages.length > 0) {
+      console.log(`[Timeout] Processed ${timedOutMessages.length} timed out messages`);
+    }
+  } catch (error) {
+    console.error('[Error] Checking message timeouts:', error);
+  }
+}
+
+// Run timeout check every minute
+setInterval(checkMessageTimeouts, 60000);
 
 // Health check
 app.get('/health', (req, res) => {
@@ -424,12 +1100,36 @@ async function start() {
 ║  HTTP:  http://localhost:${PORT}                         ║
 ║  WS:    ws://localhost:${PORT}/ws                        ║
 ╠══════════════════════════════════════════════════════════╣
-║  Endpoints:                                              ║
+║  Core Endpoints:                                         ║
 ║    POST /api/agents/register   - Register agent          ║
 ║    GET  /api/agents            - List agents             ║
 ║    POST /api/messages          - Send message            ║
 ║    GET  /api/messages/:id      - Get messages            ║
 ║    POST /api/broadcast         - Broadcast to all        ║
+╠══════════════════════════════════════════════════════════╣
+║  Agent Groups:                                           ║
+║    POST   /api/groups                      - Create group ║
+║    GET    /api/groups                      - List groups  ║
+║    GET    /api/groups/:id                  - Get group    ║
+║    POST   /api/groups/:id/members          - Add member   ║
+║    DELETE /api/groups/:id/members/:agentId - Remove      ║
+║    GET    /api/agents/:id/groups           - Agent groups ║
+║    GET    /api/groups/:id/agents           - List members ║
+║    POST   /api/groups/:id/broadcast        - Group msg    ║
+╠══════════════════════════════════════════════════════════╣
+║  Collective Memory:                                      ║
+║    POST    /api/groups/:id/memory          - Store       ║
+║    GET     /api/groups/:id/memory          - Get all     ║
+║    GET     /api/groups/:id/memory/:key     - Get key     ║
+║    DELETE  /api/groups/:id/memory/:key     - Delete      ║
+║    GET     /api/groups/:id/memory/:key/history - History║
+╠══════════════════════════════════════════════════════════╣
+║  Error Handling:                                         ║
+║    PATCH  /api/messages/:id/status        - Update stat  ║
+║    GET    /api/messages/:id/failed        - Failed msgs  ║
+║    POST   /api/messages/:id/retry         - Retry msg    ║
+╠══════════════════════════════════════════════════════════╣
+║  Skills:                                                 ║
 ║    POST /api/skills            - Register skill          ║
 ║    GET  /api/skills            - Discover skills         ║
 ║    POST /api/skills/:id/invoke - Invoke skill            ║
