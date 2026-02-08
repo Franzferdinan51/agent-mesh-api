@@ -1,5 +1,8 @@
 node_modules/
 agent-mesh.db
+agent-mesh.db-*
+agent-mesh.db-shm
+agent-mesh.db-wal
 *.log
 webui/node_modules/
 webui/dist/
