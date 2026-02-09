@@ -44,14 +44,16 @@ async function initDb() {
     driver: sqlite3.Database
   });
 
-  // Enable WAL mode for better durability and concurrency
-  await db.exec('PRAGMA journal_mode = WAL;');
-  await db.exec('PRAGMA synchronous = NORMAL;');
+  // Windows-safe SQLite settings (WAL mode has issues on Windows)
+  await db.exec('PRAGMA journal_mode = DELETE;');
+  await db.exec('PRAGMA synchronous = FULL;');
   await db.exec('PRAGMA busy_timeout = 5000;');
   await db.exec('PRAGMA foreign_keys = ON;');
+  await db.exec('PRAGMA temp_store = MEMORY;');
+  await db.exec('PRAGMA locking_mode = NORMAL;');
 
   console.log(`[DB] SQLite initialized: ${dbPath}`);
-  console.log('[DB] Durability settings: WAL mode, NORMAL sync, 5s timeout');
+  console.log('[DB] Windows-safe mode: DELETE journal, FULL sync, MEMORY temp_store');
 
   await db.exec(`
     CREATE TABLE IF NOT EXISTS agents (
