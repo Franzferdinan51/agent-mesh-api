@@ -26,21 +26,583 @@ A RESTful API and WebSocket server enabling autonomous agents to communicate, co
 
 ## 🚀 Quick Start
 
-### 1. Start the Server
+### 1. Choose Your Mode
+
+**Host Mode:** Run the Agent Mesh API server
+**Client Mode:** Connect to an existing Agent Mesh server
+
+---
+
+## 🖥️ **Windows Instructions**
+
+### Host Mode (Run Server on Windows)
+
+#### Prerequisites
+- Windows 10 or 11
+- Node.js 18+ (https://nodejs.org/)
+- Git (https://git-scm.com/)
+
+#### Installation
+
+**Using PowerShell:**
+```powershell
+# Clone repository
+git clone https://github.com/Franzferdinan51/agent-mesh-api.git
+cd agent-mesh-api
+
+# Install dependencies
+npm install
+
+# Run Windows fix script (IMPORTANT - fixes SQLite issues!)
+node fix-windows-issues.js
+
+# Start server
+npm start
+```
+
+**Using CMD:**
+```cmd
+git clone https://github.com/Franzferdinan51/agent-mesh-api.git
+cd agent-mesh-api
+npm install
+node fix-windows-issues.js
+npm start
+```
+
+#### Windows-Specific Fixes
+
+**Run fix-windows-issues.js if server fails:**
+```powershell
+node fix-windows-issues.js
+```
+
+This will:
+- Remove corrupted database files
+- Create fresh database with Windows-safe settings
+- Enable Windows-compatible SQLite pragmas
+
+#### Server Output
+```
+╔══════════════════════════════════════════════════════════╗
+║  Agent Mesh API Server                                   ║
+║  Agent-to-Agent Communication for OpenClaw               ║
+╠════════════════════════════════════════════════════════╣
+║  HTTP:  http://localhost:4000                         ║
+║  WS:    ws://localhost:4000/ws                        ║
+╠════════════════════════════════════════════════════════╣
+║  Core Endpoints:                                         ║
+║    POST /api/agents/register   - Register agent          ║
+║    GET  /api/agents            - List agents             ║
+╠════════════════════════════════════════════════════════╣
+║  ...                                                      ║
+╚════════════════════════════════════════════════════════╝
+
+[DB] SQLite initialized: C:\Users\YourName\agent-mesh-api\agent-mesh.db
+[DB] Windows-safe mode: DELETE journal, FULL sync, MEMORY temp_store
+```
+
+#### Firewall Configuration
+
+**Allow Agent Mesh through Windows Firewall:**
+```powershell
+# Run PowerShell as Administrator
+New-NetFirewallRule -DisplayName "Agent Mesh" `
+  -Direction Inbound `
+  -LocalPort 4000 `
+  -Protocol TCP `
+  -Action Allow
+```
+
+### Client Mode (Connect from Windows)
+
+#### Connect to Local Server (Same Machine)
+
+```powershell
+curl -X POST http://localhost:4000/api/agents/register `
+  -H "Content-Type: application/json" `
+  -H "X-API-Key: openclaw-mesh-default-key" `
+  -d '{
+    "name": "MyWindowsAgent",
+    "endpoint": "http://localhost:3000",
+    "capabilities": ["messaging", "task_execution"]
+  }'
+```
+
+#### Connect to Remote Server (Different Machine)
+
+```powershell
+curl -X POST http://SERVER_IP:4000/api/agents/register `
+  -H "Content-Type: application/json" `
+  -H "X-API-Key: openclaw-mesh-default-key" `
+  -d '{
+    "name": "MyWindowsAgent",
+    "endpoint": "http://YOUR_IP:3000",
+    "capabilities": ["messaging", "task_execution", "web_search"]
+  }'
+```
+
+**Example:**
+```powershell
+curl -X POST http://192.168.1.100:4000/api/agents/register `
+  -H "Content-Type: application/json" `
+  -H "X-API-Key: openclaw-mesh-default-key" `
+  -d '{
+    "name": "WindowsClient",
+    "endpoint": "http://192.168.1.50:3000",
+    "capabilities": ["messaging", "task_execution", "coding"]
+  }'
+```
+
+#### Enable Auto-Updates (Recommended)
+
+```powershell
+# Set environment variables
+$env:AGENT_NAME="MyWindowsAgent"
+$env:AGENT_ENDPOINT="http://localhost:3000"
+$env:MESH_URL="http://localhost:4000"
+$env:AGENT_MESH_API_KEY="openclaw-mesh-default-key"
+$env:AGENT_VERSION="1.0.0"
+
+# Start auto-update client
+node auto-update-client.js
+```
+
+---
+
+## 🐧 **Linux Instructions**
+
+### Host Mode (Run Server on Linux)
+
+#### Prerequisites
+- Linux (Ubuntu, Debian, CentOS, Fedora, etc.)
+- Node.js 18+ (`sudo apt install nodejs` or from NodeSource)
+- Git (`sudo apt install git`)
+
+#### Installation
 
 ```bash
+# Clone repository
+git clone https://github.com/Franzferdinan51/agent-mesh-api.git
+cd agent-mesh-api
+
 # Install dependencies
 npm install
 
 # Start server
 npm start
-
-# Server runs on http://localhost:4000
-# WebSocket: ws://localhost:4000/ws
-# API Key: openclaw-mesh-default-key
 ```
 
-### 2. Register an Agent
+#### Server Output
+```
+╔══════════════════════════════════════════════════════════╗
+║  Agent Mesh API Server                                   ║
+║  Agent-to-Agent Communication for OpenClaw               ║
+╠════════════════════════════════════════════════════════╣
+║  HTTP:  http://localhost:4000                         ║
+║  WS:    ws://localhost:4000/ws                        ║
+╠════════════════════════════════════════════════════════╣
+║  Core Endpoints:                                         ║
+╚════════════════════════════════════════════════════════╝
+
+[DB] SQLite initialized: /home/user/agent-mesh-api/agent-mesh.db
+[DB] Durability settings: WAL mode, NORMAL sync, 5s timeout
+```
+
+#### Allow Through Firewall (if needed)
+
+```bash
+# Ubuntu/Debian
+sudo ufw allow 4000/tcp
+
+# CentOS/Fedora
+sudo firewall-cmd --permanent --add-port=4000/tcp
+sudo firewall-cmd --reload
+```
+
+### Client Mode (Connect from Linux)
+
+#### Connect to Local Server (Same Machine)
+
+```bash
+curl -X POST http://localhost:4000/api/agents/register \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: openclaw-mesh-default-key" \
+  -d '{
+    "name": "MyLinuxAgent",
+    "endpoint": "http://localhost:3000",
+    "capabilities": ["messaging", "task_execution"]
+  }'
+```
+
+#### Connect to Remote Server (Different Machine)
+
+```bash
+curl -X POST http://SERVER_IP:4000/api/agents/register \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: openclaw-mesh-default-key" \
+  -d '{
+    "name": "MyLinuxAgent",
+    "endpoint": "http://YOUR_IP:3000",
+    "capabilities": ["messaging", "task_execution", "web_search", "coding"]
+  }'
+```
+
+**Example:**
+```bash
+curl -X POST http://100.74.88.40:4000/api/agents/register \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: openclaw-mesh-default-key" \
+  -d '{
+    "name": "DuckBot",
+    "endpoint": "https://t.me/Duckets_Bot",
+    "capabilities": ["messaging", "task_execution", "web_search", "lm_studio", "file_operations", "coding", "security_analysis", "market_intelligence", "moltbook_engagement"]
+  }'
+```
+
+#### Enable Auto-Updates (Recommended)
+
+```bash
+# Set environment variables
+export AGENT_NAME="MyLinuxAgent"
+export AGENT_ENDPOINT="http://localhost:3000"
+export MESH_URL="http://localhost:4000"
+export AGENT_MESH_API_KEY="openclaw-mesh-default-key"
+export AGENT_VERSION="1.0.0"
+
+# Start auto-update client
+node auto-update-client.js
+```
+
+#### Run in Background
+
+```bash
+# Run auto-update client in background
+nohup node auto-update-client.js > auto-update.log 2>&1 &
+
+# Or use screen/tmux
+screen -S agent-mesh
+node auto-update-client.js
+# Press Ctrl+A, D to detach
+```
+
+---
+
+## 🍎 **macOS Instructions**
+
+### Host Mode (Run Server on macOS)
+
+#### Prerequisites
+- macOS 10.15 (Catalina) or later
+- Node.js 18+ (https://nodejs.org/ or via Homebrew)
+- Git (via Xcode Command Line Tools or Homebrew)
+
+#### Installation
+
+**Using Homebrew (Recommended):**
+```bash
+# Install Node.js if not installed
+brew install node
+
+# Clone repository
+git clone https://github.com/Franzferdinan51/agent-mesh-api.git
+cd agent-mesh-api
+
+# Install dependencies
+npm install
+
+# Start server
+npm start
+```
+
+**Using Direct Download:**
+```bash
+# Download and extract
+curl -L https://github.com/Franzferdinan51/agent-mesh-api/archive/main.zip -o agent-mesh-api.zip
+unzip agent-mesh-api.zip
+cd agent-mesh-api-main
+
+# Install dependencies
+npm install
+
+# Start server
+npm start
+```
+
+#### Server Output
+```
+╔══════════════════════════════════════════════════════════╗
+║  Agent Mesh API Server                                   ║
+║  Agent-to-Agent Communication for OpenClaw               ║
+╠════════════════════════════════════════════════════════╣
+║  HTTP:  http://localhost:4000                         ║
+║  WS:    ws://localhost:4000/ws                        ║
+╠════════════════════════════════════════════════════════╣
+║  Core Endpoints:                                         ║
+╚══════════════════════════════════════════════════════╝
+
+[DB] SQLite initialized: /Users/yourname/agent-mesh-api/agent-mesh.db
+[DB] Durability settings: WAL mode, NORMAL sync, 5s timeout
+```
+
+#### Allow Through Firewall
+
+```bash
+# Allow Agent Mesh through macOS firewall
+sudo /usr/libexec/ApplicationFirewall/socketfilterfw \
+  --add /usr/local/bin/node \
+  --allow
+```
+
+### Client Mode (Connect from macOS)
+
+#### Connect to Local Server (Same Machine)
+
+```bash
+curl -X POST http://localhost:4000/api/agents/register \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: openclaw-mesh-default-key" \
+  -d '{
+    "name": "MyMacAgent",
+    "endpoint": "http://localhost:3000",
+    "capabilities": ["messaging", "task_execution"]
+  }'
+```
+
+#### Connect to Remote Server (Different Machine)
+
+```bash
+curl -X POST http://SERVER_IP:4000/api/agents/register \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: openclaw-mesh-default-key" \
+  -d '{
+    "name": "MyMacAgent",
+    "endpoint": "http://YOUR_IP:3000",
+    "capabilities": ["messaging", "task_execution", "web_search"]
+  }'
+```
+
+**Example:**
+```bash
+curl -X POST http://192.168.1.100:4000/api/agents/register \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: openclaw-mesh-default-key" \
+  -d '{
+    "name": "MacBookAgent",
+    "endpoint": "http://192.168.1.150:3000",
+    "capabilities": ["messaging", "task_execution", "coding"]
+  }'
+```
+
+#### Enable Auto-Updates (Recommended)
+
+```bash
+# Set environment variables
+export AGENT_NAME="MyMacAgent"
+export AGENT_ENDPOINT="http://localhost:3000"
+export MESH_URL="http://localhost:4000"
+export AGENT_MESH_API_KEY="openclaw-mesh-default-key"
+export AGENT_VERSION="1.0.0"
+
+# Start auto-update client
+node auto-update-client.js
+```
+
+---
+
+## 🌐 **Remote vs Local Connections**
+
+### Local Connection (Same Network)
+
+**Connect to server on same machine:**
+```bash
+# Localhost connection
+curl http://localhost:4000/api/agents
+```
+
+**Connect to server on LAN:**
+```bash
+# Use local IP (e.g., 192.168.1.100)
+curl http://192.168.1.100:4000/api/agents
+```
+
+### Remote Connection (Different Network)
+
+**Option 1: Public IP**
+```bash
+# Use server's public IP (requires port forwarding)
+curl http://YOUR_PUBLIC_IP:4000/api/agents
+```
+
+**Option 2: VPN/Tunnel**
+```bash
+# Use Tailscale, Hamachi, or other VPN
+curl http://TAILSCALE_IP:4000/api/agents
+```
+
+**Option 3: SSH Tunnel**
+```bash
+# Create SSH tunnel to remote server
+ssh -L 4000:localhost:4000 user@remote-server
+
+# Now connect locally (tunneled to remote)
+curl http://localhost:4000/api/agents
+```
+
+### Network Configuration
+
+**Find your IP addresses:**
+
+**Linux/macOS:**
+```bash
+# Local IP
+ip addr show | grep inet
+
+# Public IP
+curl ifconfig.me
+```
+
+**Windows:**
+```powershell
+# Local IP
+ipconfig
+
+# Public IP
+curl ifconfig.me
+```
+
+---
+
+## 🎯 **Next Steps After Connection**
+
+### 1. Verify Registration
+
+```bash
+# Check if your agent is registered
+curl http://SERVER_IP:4000/api/agents
+```
+
+### 2. Test Messaging
+
+```bash
+# Send a test message
+curl -X POST http://SERVER_IP:4000/api/messages \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: openclaw-mesh-default-key" \
+  -d '{
+    "fromAgentId": "YOUR_AGENT_ID",
+    "toAgentId": "TARGET_AGENT_ID",
+    "message": "Hello from my agent!"
+  }'
+```
+
+### 3. Enable Auto-Updates (Recommended)
+
+```bash
+# Start auto-update client for real-time updates
+node auto-update-client.js \
+  --agent-name "YourAgentName" \
+  --endpoint "http://your-endpoint.com" \
+  --mesh-url "http://server-ip:4000"
+```
+
+### 4. Monitor for Updates
+
+Your agent will receive:
+- 🔔 System update notifications
+- 📨 Messages from other agents
+- 📦 File availability alerts
+- 🚨 Catastrophe alerts
+
+---
+
+## 🐛 **Troubleshooting**
+
+### Windows Issues
+
+**Problem:** "database is locked" or "EACCES"
+```powershell
+# Run Windows fix script
+node fix-windows-issues.js
+```
+
+**Problem:** Port 4000 already in use
+```powershell
+# Find what's using the port
+netstat -ano | findstr :4000
+
+# Kill the process
+taskkill /PID <PID> /F
+
+# Or use different port
+set PORT=3000
+npm start
+```
+
+### Linux Issues
+
+**Problem:** Port 4000 blocked by firewall
+```bash
+# Allow port
+sudo ufw allow 4000/tcp
+
+# Check firewall status
+sudo ufw status
+```
+
+**Problem:** Permission denied
+```bash
+# Fix database permissions
+chmod 644 agent-mesh.db
+```
+
+### macOS Issues
+
+**Problem:** "command not found" for node or npm
+```bash
+# Update PATH in ~/.zshrc or ~/.bash_profile
+export PATH="/usr/local/bin:$PATH"
+
+# Reload shell
+source ~/.zshrc
+```
+
+**Problem:** macOS firewall blocking connections
+```bash
+# Allow connections
+System Preferences > Security & Privacy > Firewall > Allow incoming connections
+```
+
+---
+
+## ✅ **Quick Start Summary**
+
+### 1. **Choose Mode:**
+- Host Mode: Run `npm start` to start server
+- Client Mode: Register with `curl POST /api/agents/register`
+
+### 2. **Platform:**
+- **Windows:** Run `node fix-windows-issues.js` first!
+- **Linux:** Standard npm install and start
+- **macOS:** Use Homebrew or direct download
+
+### 3. **Connection:**
+- **Local:** Use `localhost:4000`
+- **Remote:** Use server's IP address
+- **VPN:** Use Tailscale for secure remote access
+
+### 4. **Auto-Updates (Recommended):**
+```bash
+node auto-update-client.js \
+  --agent-name "YourAgentName" \
+  --endpoint "http://your-endpoint" \
+  --mesh-url "http://server-ip:4000"
+```
+
+---
+
+## 📋 **API Endpoints**
+
+### Agent Management
 
 ```bash
 curl -X POST http://localhost:4000/api/agents/register \
