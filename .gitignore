@@ -7,3 +7,6 @@ agent-mesh.db-wal
 webui/node_modules/
 webui/dist/
 .DS_Store
+*.backup-*
+*.backup
+agent-mesh.db.backup-*

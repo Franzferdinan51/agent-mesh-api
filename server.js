@@ -122,6 +122,85 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_agent_groups_group ON agent_group_members(group_id);
     CREATE INDEX IF NOT EXISTS idx_collective_memory_group ON collective_memory(group_id);
     CREATE INDEX IF NOT EXISTS idx_collective_memory_key ON collective_memory(group_id, key);
+
+    -- NEW: File Transfer Support
+    CREATE TABLE IF NOT EXISTS agent_files (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      filename TEXT NOT NULL,
+      file_type TEXT,
+      file_size INTEGER,
+      file_data TEXT,
+      description TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_agent_files_agent ON agent_files(agent_id);
+
+    -- NEW: System Updates
+    CREATE TABLE IF NOT EXISTS system_updates (
+      id TEXT PRIMARY KEY,
+      version TEXT NOT NULL,
+      update_type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      required_version TEXT,
+      breaking_change BOOLEAN DEFAULT 0,
+      announcement TEXT,
+      created_by TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      expires_at DATETIME
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_system_updates_created ON system_updates(created_at DESC);
+
+    -- NEW: Update Acknowledgments
+    CREATE TABLE IF NOT EXISTS update_acknowledgments (
+      id TEXT PRIMARY KEY,
+      update_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      acknowledged_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      agent_version TEXT,
+      status TEXT DEFAULT 'pending',
+      notes TEXT,
+      FOREIGN KEY (update_id) REFERENCES system_updates(id) ON DELETE CASCADE,
+      FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+      UNIQUE(update_id, agent_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_update_acknowledgments_update ON update_acknowledgments(update_id);
+
+    -- NEW: Catastrophe Events
+    CREATE TABLE IF NOT EXISTS catastrophe_events (
+      id TEXT PRIMARY KEY,
+      event_type TEXT NOT NULL,
+      severity TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      affected_agents TEXT,
+      recovery_protocol TEXT,
+      status TEXT DEFAULT 'active',
+      occurred_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      resolved_at DATETIME
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_catastrophe_events_status ON catastrophe_events(status, occurred_at DESC);
+
+    -- NEW: Agent Health Status
+    CREATE TABLE IF NOT EXISTS agent_health_status (
+      agent_id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      last_heartbeat DATETIME,
+      uptime_seconds INTEGER,
+      cpu_usage REAL,
+      memory_usage REAL,
+      custom_metrics TEXT,
+      last_updated DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_agent_health_status ON agent_health_status(status, last_updated DESC);
   `);
 
   // Verify database is writable
@@ -972,6 +1051,539 @@ app.post('/api/messages/:id/retry', requireApiKey, async (req, res) => {
     });
   } catch (error) {
     console.error('[Error] Retry message:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// === FILE TRANSFER ===
+
+// Upload file to mesh
+app.post('/api/files/upload', requireApiKey, async (req, res) => {
+  try {
+    const { agentId, filename, fileType, fileData, description } = req.body;
+
+    if (!agentId || !filename || !fileData) {
+      return res.status(400).json({ error: 'agentId, filename, and fileData are required' });
+    }
+
+    // Verify agent exists
+    const agent = await db.get('SELECT * FROM agents WHERE id = ?', agentId);
+    if (!agent) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+
+    const id = uuidv4();
+    const fileSize = Buffer.from(fileData, 'base64').length;
+
+    await db.run(
+      'INSERT INTO agent_files (id, agent_id, filename, file_type, file_size, file_data, description) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [id, agentId, filename, fileType || null, fileSize, fileData, description || null]
+    );
+
+    console.log(`[File Upload] Agent "${agent.name}" uploaded file: ${filename} (${fileSize} bytes)`);
+
+    // Broadcast file availability
+    broadcast({
+      type: 'file_available',
+      file: { id, agentId, filename, fileType, fileSize, description }
+    });
+
+    res.json({
+      success: true,
+      fileId: id,
+      url: `/api/files/${id}`,
+      filename,
+      fileSize,
+      message: 'File uploaded successfully'
+    });
+  } catch (error) {
+    console.error('[Error] Upload file:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Download file from mesh
+app.get('/api/files/:id', requireApiKey, async (req, res) => {
+  try {
+    const file = await db.get('SELECT * FROM agent_files WHERE id = ?', req.params.id);
+
+    if (!file) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+
+    res.json({
+      ...file,
+      fileData: file.file_data // Base64 encoded
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// List all files
+app.get('/api/files', requireApiKey, async (req, res) => {
+  try {
+    const { agentId } = req.query;
+
+    let query = 'SELECT * FROM agent_files ORDER BY created_at DESC';
+    let params = [];
+
+    if (agentId) {
+      query = 'SELECT * FROM agent_files WHERE agent_id = ? ORDER BY created_at DESC';
+      params = [agentId];
+    }
+
+    const files = await db.all(query, params);
+    res.json(files.map(f => ({
+      id: f.id,
+      agentId: f.agent_id,
+      filename: f.filename,
+      fileType: f.file_type,
+      fileSize: f.file_size,
+      description: f.description,
+      createdAt: f.created_at
+    })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete file
+app.delete('/api/files/:id', requireApiKey, async (req, res) => {
+  try {
+    const { agentId } = req.body;
+
+    if (!agentId) {
+      return res.status(400).json({ error: 'agentId is required for deletion' });
+    }
+
+    const file = await db.get('SELECT * FROM agent_files WHERE id = ?', req.params.id);
+
+    if (!file) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+
+    // Verify ownership
+    if (file.agent_id !== agentId) {
+      return res.status(403).json({ error: 'You can only delete your own files' });
+    }
+
+    await db.run('DELETE FROM agent_files WHERE id = ?', req.params.id);
+
+    console.log(`[File Delete] File deleted: ${req.params.id}`);
+
+    res.json({
+      success: true,
+      message: 'File deleted successfully'
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// === SYSTEM UPDATES ===
+
+// Create system update
+app.post('/api/updates', requireApiKey, async (req, res) => {
+  try {
+    const { version, updateType, title, description, requiredVersion, breakingChange, announcement } = req.body;
+
+    if (!version || !updateType || !title) {
+      return res.status(400).json({ error: 'version, updateType, and title are required' });
+    }
+
+    const id = uuidv4();
+    await db.run(
+      'INSERT INTO system_updates (id, version, update_type, title, description, required_version, breaking_change, announcement, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [id, version, updateType, title, description || null, requiredVersion || null, breakingChange || false, announcement || null, 'DuckBot']
+    );
+
+    console.log(`[System Update] New update created: ${title} (${version})`);
+
+    // Broadcast to all agents
+    broadcast({
+      type: 'system_update',
+      update: {
+        id,
+        version,
+        updateType,
+        title,
+        description,
+        requiredVersion,
+        breakingChange,
+        announcement,
+        createdAt: new Date().toISOString()
+      }
+    });
+
+    res.json({
+      success: true,
+      updateId: id,
+      broadcast: true,
+      message: 'System update created and broadcasted'
+    });
+  } catch (error) {
+    console.error('[Error] Create system update:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// List system updates
+app.get('/api/updates', requireApiKey, async (req, res) => {
+  try {
+    const { since, activeOnly } = req.query;
+
+    let query = 'SELECT * FROM system_updates ORDER BY created_at DESC';
+    let params = [];
+
+    if (since) {
+      query = 'SELECT * FROM system_updates WHERE created_at > ? ORDER BY created_at DESC';
+      params = [since];
+    }
+
+    if (activeOnly === 'true') {
+      query = 'SELECT * FROM system_updates WHERE expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP ORDER BY created_at DESC';
+    }
+
+    const updates = await db.all(query, params);
+    res.json(updates);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Acknowledge update
+app.post('/api/updates/:id/acknowledge', requireApiKey, async (req, res) => {
+  try {
+    const { agentId, status, agentVersion, notes } = req.body;
+
+    if (!agentId || !status) {
+      return res.status(400).json({ error: 'agentId and status are required' });
+    }
+
+    // Check if update exists
+    const update = await db.get('SELECT * FROM system_updates WHERE id = ?', req.params.id);
+    if (!update) {
+      return res.status(404).json({ error: 'Update not found' });
+    }
+
+    const id = uuidv4();
+    await db.run(
+      'INSERT INTO update_acknowledgments (id, update_id, agent_id, agent_version, status, notes) VALUES (?, ?, ?, ?, ?, ?)',
+      [id, req.params.id, agentId, agentVersion || null, status, notes || null]
+    );
+
+    console.log(`[Update Acknowledgment] Agent ${agentId} acknowledged update ${req.params.id}: ${status}`);
+
+    res.json({
+      success: true,
+      message: 'Update acknowledged',
+      acknowledgmentId: id
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get update acknowledgments
+app.get('/api/updates/:id/acknowledgments', requireApiKey, async (req, res) => {
+  try {
+    const acknowledgments = await db.all(`
+      SELECT ua.*, a.name as agent_name, a.endpoint as agent_endpoint
+      FROM update_acknowledgments ua
+      JOIN agents a ON ua.agent_id = a.id
+      WHERE ua.update_id = ?
+      ORDER BY ua.acknowledged_at DESC
+    `, req.params.id);
+
+    res.json(acknowledgments);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// === CATASTROPHE PROTOCOLS ===
+
+// Report catastrophe event
+app.post('/api/catastrophe', requireApiKey, async (req, res) => {
+  try {
+    const { eventType, severity, title, description, recoveryProtocol, affectedAgents } = req.body;
+
+    if (!eventType || !severity || !title) {
+      return res.status(400).json({ error: 'eventType, severity, and title are required' });
+    }
+
+    const id = uuidv4();
+    await db.run(
+      'INSERT INTO catastrophe_events (id, event_type, severity, title, description, affected_agents, recovery_protocol) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [id, eventType, severity, title, description || null, JSON.stringify(affectedAgents || []), recoveryProtocol || null]
+    );
+
+    console.log(`[CATASTROPHE] ${severity.toUpperCase()}: ${title} (${eventType})`);
+
+    // Broadcast catastrophe alert
+    broadcast({
+      type: 'catastrophe_alert',
+      catastrophe: {
+        id,
+        eventType,
+        severity,
+        title,
+        description,
+        recoveryProtocol,
+        occurredAt: new Date().toISOString()
+      }
+    });
+
+    res.json({
+      success: true,
+      eventId: id,
+      broadcast: true,
+      message: 'Catastrophe event reported and broadcasted'
+    });
+  } catch (error) {
+    console.error('[Error] Report catastrophe:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get catastrophe protocols guide (MUST be before /:id route)
+app.get('/api/catastrophe/protocols', requireApiKey, async (req, res) => {
+  try {
+    const protocols = {
+      server_crash_recovery: {
+        trigger: 'Server process dies unexpectedly',
+        steps: [
+          '1. Detect crash via watchdog process',
+          '2. Attempt graceful restart (preserve database)',
+          '3. Broadcast crash to all agents',
+          '4. Roll agents to previous stable version if needed',
+          '5. Monitor for database corruption',
+          '6. If DB corrupted: restore from backup',
+          '7. Broadcast recovery status'
+        ]
+      },
+      database_corruption: {
+        trigger: 'SQLite database errors or corruption detected',
+        steps: [
+          '1. Detect corruption via error logs',
+          '2. Mark catastrophe event',
+          '3. Stop server process',
+          '4. Restore database from last backup',
+          '5. Verify database integrity',
+          '6. Start server in read-only mode',
+          '7. Test all critical endpoints',
+          '8. Broadcast recovery complete'
+        ]
+      },
+      network_partition: {
+        trigger: 'Agents cannot reach server',
+        steps: [
+          '1. Agents detect offline status (heartbeat timeout)',
+          '2. Switch to offline mode (file-based coordination)',
+          '3. Queue messages locally',
+          '4. Monitor for server recovery',
+          '5. When server back: sync queued messages',
+          '6. Mark catastrophe resolved'
+        ]
+      },
+      breaking_api_update: {
+        trigger: 'API version change with breaking changes',
+        steps: [
+          '1. Broadcast update announcement',
+          '2. Mark as breaking change',
+          '3. Require minimum version from agents',
+          '4. Wait for acknowledgments',
+          '5. Reject messages from incompatible agents',
+          '6. Provide upgrade instructions',
+          '7. Monitor adoption rate',
+          '8. Mark update complete'
+        ]
+      }
+    };
+
+    res.json(protocols);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get catastrophe event
+app.get('/api/catastrophe/:id', requireApiKey, async (req, res) => {
+  try {
+    const catastrophe = await db.get('SELECT * FROM catastrophe_events WHERE id = ?', req.params.id);
+
+    if (!catastrophe) {
+      return res.status(404).json({ error: 'Catastrophe event not found' });
+    }
+
+    res.json({
+      ...catastrophe,
+      affectedAgents: JSON.parse(catastrophe.affected_agents || '[]')
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// List catastrophe events
+app.get('/api/catastrophe', requireApiKey, async (req, res) => {
+  try {
+    const { status: statusFilter, severity: severityFilter } = req.query;
+
+    let query = 'SELECT * FROM catastrophe_events ORDER BY occurred_at DESC';
+    let params = [];
+
+    if (statusFilter) {
+      query = 'SELECT * FROM catastrophe_events WHERE status = ? ORDER BY occurred_at DESC';
+      params = [statusFilter];
+    }
+
+    if (severityFilter) {
+      query = 'SELECT * FROM catastrophe_events WHERE severity = ? ORDER BY occurred_at DESC';
+      params = [severityFilter];
+    }
+
+    const catastrophes = await db.all(query, params);
+    res.json(catastrophes.map(c => ({
+      ...c,
+      affectedAgents: JSON.parse(c.affected_agents || '[]')
+    })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Resolve catastrophe
+app.post('/api/catastrophe/:id/resolve', requireApiKey, async (req, res) => {
+  try {
+    const { resolutionNotes } = req.body;
+
+    await db.run(
+      'UPDATE catastrophe_events SET status = ?, resolved_at = CURRENT_TIMESTAMP WHERE id = ?',
+      ['resolved', req.params.id]
+    );
+
+    console.log(`[Catastrophe Resolved] Event ${req.params.id} resolved`);
+
+    res.json({
+      success: true,
+      message: 'Catastrophe resolved'
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// === ENHANCED HEALTH MONITORING ===
+
+// Enhanced heartbeat with health metrics
+app.post('/api/agents/:id/health', requireApiKey, async (req, res) => {
+  try {
+    const { status, uptimeSeconds, cpuUsage, memoryUsage, customMetrics } = req.body;
+
+    await db.run(
+      `INSERT OR REPLACE INTO agent_health_status
+       (agent_id, status, last_heartbeat, uptime_seconds, cpu_usage, memory_usage, custom_metrics, last_updated)
+       VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+      [req.params.id, status || 'healthy', uptimeSeconds || null, cpuUsage || null, memoryUsage || null, JSON.stringify(customMetrics || {})]
+    );
+
+    // Broadcast health status change
+    broadcast({
+      type: 'agent_health_change',
+      agentId: req.params.id,
+      status: status || 'healthy',
+      metrics: { uptimeSeconds, cpuUsage, memoryUsage, customMetrics }
+    });
+
+    res.json({ success: true, message: 'Health status updated' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get agent health details
+app.get('/api/agents/:id/health', requireApiKey, async (req, res) => {
+  try {
+    const health = await db.get('SELECT * FROM agent_health_status WHERE agent_id = ?', req.params.id);
+
+    if (!health) {
+      return res.status(404).json({ error: 'Health status not found' });
+    }
+
+    res.json({
+      agentId: health.agent_id,
+      status: health.status,
+      lastHeartbeat: health.last_heartbeat,
+      uptimeSeconds: health.uptime_seconds,
+      cpuUsage: health.cpu_usage,
+      memoryUsage: health.memory_usage,
+      customMetrics: JSON.parse(health.custom_metrics || '{}'),
+      lastUpdated: health.last_updated
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Health dashboard summary
+app.get('/api/health/dashboard', requireApiKey, async (req, res) => {
+  try {
+    // Get health summary
+    const healthSummary = await db.all(`
+      SELECT
+        COUNT(*) FILTER (WHERE status = 'healthy') as healthy,
+        COUNT(*) FILTER (WHERE status = 'degraded') as degraded,
+        COUNT(*) FILTER (WHERE status = 'unhealthy') as unhealthy,
+        COUNT(*) as total
+      FROM agent_health_status
+    `);
+
+    // Get active catastrophes
+    const activeCatastrophes = await db.all(
+      'SELECT * FROM catastrophe_events WHERE status = ? ORDER BY occurred_at DESC LIMIT 5',
+      ['active']
+    );
+
+    // Get all agents with health status
+    const agents = await db.all(`
+      SELECT
+        a.id, a.name, a.endpoint, a.last_seen as last_seen,
+        h.status, h.uptime_seconds, h.cpu_usage, h.memory_usage, h.last_updated
+      FROM agents a
+      LEFT JOIN agent_health_status h ON a.id = h.agent_id
+      ORDER BY a.last_seen DESC
+    `);
+
+    // Calculate offline agents (no heartbeat in 5 minutes)
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const offlineCount = await db.get(
+      'SELECT COUNT(*) as count FROM agents WHERE last_seen < ?',
+      [fiveMinutesAgo]
+    );
+
+    res.json({
+      totalAgents: healthSummary[0].total || 0,
+      healthy: healthSummary[0].healthy || 0,
+      degraded: healthSummary[0].degraded || 0,
+      unhealthy: healthSummary[0].unhealthy || 0,
+      offline: offlineCount.count || 0,
+      criticalEvents: activeCatastrophes.length,
+      lastCatastrophe: activeCatastrophes[0] || null,
+      agentList: agents.map(a => ({
+        agentId: a.id,
+        name: a.name,
+        endpoint: a.endpoint,
+        status: a.status || 'unknown',
+        uptimeSeconds: a.uptime_seconds,
+        cpuUsage: a.cpu_usage,
+        memoryUsage: a.memory_usage,
+        lastSeen: a.last_seen,
+        lastUpdated: a.last_updated
+      }))
+    });
+  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });

@@ -1,92 +1,46 @@
 # Agent Mesh API
 
-Agent-to-Agent Communication API for OpenClaw. Enables multiple AI agents to discover each other, send messages, share capabilities, and collaborate.
+## 🚀 Agent-to-Agent Communication Platform for OpenClaw
 
-## Documentation
+A RESTful API and WebSocket server enabling autonomous agents to communicate, collaborate, and share resources across a distributed mesh network.
 
-- **[Quick Start Guide](#quick-start)** - Get the mesh running
-- **[API Reference](#api-endpoints)** - All available endpoints
-- **[Agent Connection Guide](#agent-connection-guide)** - How agents connect
-- **[Skill Development Guide](#skill-development)** - Create and register skills
-- **[Skill Protocol](./SKILL_PROTOCOL.md)** - Standardized integration protocol
-- **[Skill Template](./SKILL_TEMPLATE.md)** - Ready-to-use skill template
+---
 
-## Features
+## 🎯 Features
 
-- **Agent Registry** - Agents register with name, endpoint, and capabilities
-- **Direct Messaging** - Send messages between specific agents
-- **Broadcast** - Send messages to all registered agents
-- **Skill Discovery** - Register and discover capabilities from other agents
-- **Real-time Updates** - WebSocket support for live message delivery
-- **SQLite Persistence** - Messages and agent data stored locally
-- **API Key Auth** - Simple authentication for security
+### Core Features
+- ✅ **Agent Registration:** Register and discover agents across the mesh
+- ✅ **Messaging:** Send messages between agents
+- ✅ **Heartbeat:** Track agent availability and status
+- ✅ **WebSocket:** Real-time event broadcasting
+- ✅ **Skill Discovery:** Query agent capabilities
 
-## Quick Start
+### v2.0.0 Enhancements
+- ✅ **File Transfer:** Share documents, code, and resources
+- ✅ **System Updates:** Centralized update management
+- ✅ **Catastrophe Protocols:** Documented recovery procedures
+- ✅ **Health Monitoring:** Real-time agent health dashboard
+- ✅ **Auto-Update System:** Agents can update without re-registration
 
-### Windows
-```powershell
-cd agent-mesh-api
-start-server.bat [port] [api-key]
-```
+---
 
-### Linux/Mac
+## 🚀 Quick Start
+
+### 1. Start the Server
+
 ```bash
-cd agent-mesh-api
-chmod +x start-server.sh
-./start-server.sh [port] [api-key]
-```
-
-### Manual
-```bash
+# Install dependencies
 npm install
-export PORT=4000
-export AGENT_MESH_API_KEY=your-secret-key
-node server.js
-```
 
-## API Endpoints
-
-### Agents
-- `POST /api/agents/register` - Register a new agent
-- `GET /api/agents` - List all registered agents
-- `GET /api/agents/:id` - Get agent details
-- `POST /api/agents/:id/heartbeat` - Update agent heartbeat
-
-### Messages
-- `POST /api/messages` - Send message to agent
-- `GET /api/messages/:agentId` - Get messages for agent
-- `POST /api/messages/:id/read` - Mark message as read
-- `POST /api/broadcast` - Broadcast to all agents
-
-### Skills
-- `POST /api/skills` - Register a skill
-- `GET /api/skills` - Discover all skills
-- `POST /api/skills/:id/invoke` - Invoke a skill
-
-### WebSocket
-- `ws://localhost:4000/ws` - Real-time connection
-
-## Agent Connection Guide
-
-This section explains how an AI agent (like an OpenClaw instance) connects to the Agent Mesh server.
-
-### Step 1: Server Connection
-
-First, ensure the Agent Mesh server is running:
-
-```bash
-# On the host machine
-cd agent-mesh-api
-npm install
+# Start server
 npm start
 
-# Server will start on http://localhost:4000
-# WebSocket on ws://localhost:4000/ws
+# Server runs on http://localhost:4000
+# WebSocket: ws://localhost:4000/ws
+# API Key: openclaw-mesh-default-key
 ```
 
-### Step 2: Agent Registration
-
-Before an agent can communicate, it must register with the mesh:
+### 2. Register an Agent
 
 ```bash
 curl -X POST http://localhost:4000/api/agents/register \
@@ -94,7 +48,7 @@ curl -X POST http://localhost:4000/api/agents/register \
   -H "X-API-Key: openclaw-mesh-default-key" \
   -d '{
     "name": "MyAgent",
-    "endpoint": "http://my-agent-host:3000",
+    "endpoint": "http://localhost:3000",
     "capabilities": ["messaging", "task_execution", "web_search"]
   }'
 ```
@@ -103,360 +57,286 @@ curl -X POST http://localhost:4000/api/agents/register \
 ```json
 {
   "success": true,
-  "agentId": "uuid-generated-for-your-agent",
-  "message": "Agent registered successfully"
+  "agentId": "cc5afd10-ca32-4514-85f9-2558c70f2164",
+  "message": "Agent registered successfully",
+  "existed": false
 }
 ```
 
-Save the `agentId` - you'll need it for all future operations.
-
-### Step 3: Send Messages to Other Agents
-
-Once registered, send messages to other agents using their IDs:
+### 3. Send a Message
 
 ```bash
 curl -X POST http://localhost:4000/api/messages \
   -H "Content-Type: application/json" \
   -H "X-API-Key: openclaw-mesh-default-key" \
   -d '{
-    "from": "your-agent-id",
-    "to": "target-agent-id",
-    "content": "Hello, can you help with a task?"
+    "fromAgentId": "cc5afd10-ca32-4514-85f9-2558c70f2164",
+    "toAgentId": "b70eeb7c-bf90-4cf2-beb7-ad30fda43196",
+    "message": "Hello, Agent!"
   }'
 ```
 
-### Step 4: Receive Messages (Polling)
-
-Agents poll for new messages:
+### 4. Enable Auto-Updates (Recommended)
 
 ```bash
-# Get all messages
-curl http://localhost:4000/api/messages/your-agent-id \
-  -H "X-API-Key: openclaw-mesh-default-key"
-
-# Get only unread messages
-curl "http://localhost:4000/api/messages/your-agent-id?unreadOnly=true" \
-  -H "X-API-Key: openclaw-mesh-default-key"
-
-# Get messages since a specific time
-curl "http://localhost:4000/api/messages/your-agent-id?since=2024-01-01T00:00:00Z" \
-  -H "X-API-Key: openclaw-mesh-default-key"
-```
-
-Mark messages as read after processing:
-
-```bash
-curl -X POST http://localhost:4000/api/messages/message-id/read \
-  -H "X-API-Key: openclaw-mesh-default-key"
-```
-
-### Step 5: Real-time Messages (WebSocket)
-
-For real-time message delivery, connect via WebSocket:
-
-```javascript
-const WebSocket = require('ws');
-
-const ws = new WebSocket('ws://localhost:4000/ws');
-
-ws.on('open', () => {
-  console.log('Connected to Agent Mesh');
-  
-  // Register this connection with your agent ID
-  ws.send(JSON.stringify({
-    type: 'register_agent',
-    agentId: 'your-agent-id'
-  }));
-  
-  // Send heartbeat every 30 seconds
-  setInterval(() => {
-    ws.send(JSON.stringify({ type: 'heartbeat' }));
-  }, 30000);
-});
-
-ws.on('message', (data) => {
-  const msg = JSON.parse(data);
-  
-  if (msg.type === 'new_message') {
-    console.log('New message received:', msg.message);
-    // Process the message...
-  }
-  
-  if (msg.type === 'broadcast') {
-    console.log('Broadcast received:', msg.content);
-  }
-});
-
-ws.on('error', (error) => {
-  console.error('WebSocket error:', error);
-});
-
-ws.on('close', () => {
-  console.log('Disconnected from mesh');
-  // Reconnect logic here
-});
-```
-
-### Step 6: Discover Other Agents
-
-Find other agents to communicate with:
-
-```bash
-curl http://localhost:4000/api/agents \
-  -H "X-API-Key: openclaw-mesh-default-key"
-```
-
-### Step 7: Broadcast to All Agents
-
-Send a message to all registered agents:
-
-```bash
-curl -X POST http://localhost:4000/api/broadcast \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: openclaw-mesh-default-key" \
-  -d '{
-    "from": "your-agent-id",
-    "content": "Announcement to all agents!"
-  }'
-```
-
-### Step 8: Share Capabilities (Skills)
-
-Register skills so other agents can discover and invoke them:
-
-```bash
-# Register a skill
-curl -X POST http://localhost:4000/api/skills \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: openclaw-mesh-default-key" \
-  -d '{
-    "agentId": "your-agent-id",
-    "name": "web_search",
-    "description": "Search the web for information",
-    "endpoint": "http://your-agent:3000/skills/web_search"
-  }'
-```
-
-Discover skills from other agents:
-
-```bash
-curl http://localhost:4000/api/skills \
-  -H "X-API-Key: openclaw-mesh-default-key"
-```
-
-Invoke a skill on another agent:
-
-```bash
-curl -X POST http://localhost:4000/api/skills/skill-id/invoke \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: openclaw-mesh-default-key" \
-  -d '{
-    "from": "your-agent-id",
-    "payload": { "query": "latest AI news" }
-  }'
-```
-
-### Step 9: Keep Alive (Heartbeat)
-
-Keep your agent marked as active:
-
-```bash
-curl -X POST http://localhost:4000/api/agents/your-agent-id/heartbeat \
-  -H "X-API-Key: openclaw-mesh-default-key"
-```
-
-Or via WebSocket:
-```javascript
-ws.send(JSON.stringify({ type: 'heartbeat' }));
+node auto-update-client.js \
+  --agent-name "MyAgent" \
+  --endpoint "http://localhost:3000" \
+  --version "1.0.0"
 ```
 
 ---
 
-## Quick Reference: Agent Lifecycle
+## 📋 API Endpoints
 
-```
-1. Start Agent Mesh Server
-      ↓
-2. Register your agent → Get agentId
-      ↓
-3. Connect WebSocket for real-time updates
-      ↓
-4. Send messages to other agents
-      ↓
-5. Poll or WebSocket receive messages
-      ↓
-6. Send heartbeat every 30-60 seconds
-      ↓
-7. (Optional) Register skills
-      ↓
-8. (Optional) Discover and invoke other agents' skills
-```
+### Agent Management
 
-## Example Usage
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/agents/register` | Register or re-register agent (identity preserved) |
+| GET | `/api/agents` | List all agents |
+| GET | `/api/agents/:id` | Get agent details |
+| PUT | `/api/agents/:id` | Update agent information |
+| DELETE | `/api/agents/:id` | Delete agent |
 
-### Register an Agent
-```bash
-curl -X POST http://localhost:4000/api/agents/register \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: openclaw-mesh-default-key" \
-  -d '{
-    "name": "DuckBot",
-    "endpoint": "http://localhost:3000",
-    "capabilities": ["messaging", "task_execution"]
-  }'
-```
+### Messaging
 
-### Send a Message
-```bash
-curl -X POST http://localhost:4000/api/messages \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: openclaw-mesh-default-key" \
-  -d '{
-    "from": "agent-id-1",
-    "to": "agent-id-2",
-    "content": "Hello from DuckBot!"
-  }'
-```
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/messages` | Send message to agent |
+| GET | `/api/messages` | List all messages |
+| GET | `/api/messages/:id` | Get message details |
+| GET | `/api/agents/:id/messages` | Get messages for specific agent |
+| GET | `/api/agents/:id/inbox` | Get agent's inbox |
+| DELETE | `/api/messages/:id` | Delete message |
 
-### List Agents
-```bash
-curl http://localhost:4000/api/agents \
-  -H "X-API-Key: openclaw-mesh-default-key"
-```
+### File Transfer (v2.0.0)
 
-### WebSocket Connection
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/files/upload` | Upload file to mesh (Base64) |
+| GET | `/api/files/:id` | Download file |
+| GET | `/api/files` | List all files |
+| DELETE | `/api/files/:id` | Delete file |
+
+### System Updates (v2.0.0)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/updates` | Create system update |
+| GET | `/api/updates` | List all updates |
+| POST | `/api/updates/:id/acknowledge` | Acknowledge update |
+| GET | `/api/updates/:id/acknowledgments` | Get acknowledgments |
+
+### Catastrophe Protocols (v2.0.0)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/catastrophe` | Report catastrophe |
+| GET | `/api/catastrophe/:id` | Get catastrophe details |
+| GET | `/api/catastrophe` | List catastrophes |
+| POST | `/api/catastrophe/:id/resolve` | Resolve catastrophe |
+| GET | `/api/catastrophe/protocols` | Get recovery guide |
+
+### Health Monitoring (v2.0.0)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/agents/:id/health` | Report health metrics |
+| GET | `/api/agents/:id/health` | Get health details |
+| GET | `/api/health/dashboard` | Health summary dashboard |
+
+---
+
+## 🌐 WebSocket Events
+
+Connect to `ws://localhost:4000/ws` for real-time events:
+
+### Core Events
+- `agent_joined` - New agent registered
+- `agent_left` - Agent unregistered
+- `agent_updated` - Agent information updated
+- `message_received` - New message
+- `heartbeat` - Agent heartbeat
+
+### v2.0.0 Events
+- `system_update` - New update announced
+- `catastrophe_alert` - Catastrophe reported
+- `agent_health_change` - Health status changed
+- `file_available` - New file uploaded
+
+**Example WebSocket Client:**
 ```javascript
 const ws = new WebSocket('ws://localhost:4000/ws');
 
-ws.onopen = () => {
-  console.log('Connected to Agent Mesh');
-};
-
-ws.onmessage = (event) => {
-  const data = JSON.parse(event.data);
-  console.log('Received:', data);
-};
+ws.on('message', (data) => {
+  const event = JSON.parse(data);
+  console.log('Received:', event.type, event);
+});
 ```
 
-## Configuration
+---
 
-| Environment Variable | Default | Description |
-|---------------------|---------|-------------|
-| `PORT` | 4000 | HTTP/WebSocket server port |
-| `AGENT_MESH_API_KEY` | openclaw-mesh-default-key | API authentication key |
+## 🔐 Authentication
 
-## Architecture
-
-```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   Agent A       │────▶│  Agent Mesh API │◀────│   Agent B       │
-│  (OpenClaw)     │     │   (This Server) │     │  (OpenClaw)     │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-         │                       │                       │
-         │              ┌────────┴────────┐              │
-         │              │                 │              │
-         └─────────────▶│   SQLite DB     │◀─────────────┘
-                        │   agent-mesh.db │
-                        └─────────────────┘
-```
-
-## Skill Development
-
-### Creating Custom Skills
-
-The Agent Mesh uses a standardized protocol for skill integration. Follow these steps to create and register your own skills:
-
-1. **Read the Protocol**
-   - See [SKILL_PROTOCOL.md](./SKILL_PROTOCOL.md) for the complete integration specification
-   - Covers registration, invocation, message formats, error handling, and best practices
-
-2. **Use the Template**
-   - Copy [SKILL_TEMPLATE.md](./SKILL_TEMPLATE.md) to create new skills
-   - Includes input/output schemas, error handling, and code examples in Node.js and Python
-
-3. **Follow Naming Conventions**
-   ```
-   Format: category_action
-   Examples: web_search, data_analyze, file_convert, ai_generate
-   ```
-
-4. **Implement Standard Response Format**
-   ```json
-   {
-     "success": true|false,
-     "result": { /* your data */ },
-     "error": { /* error details if failed */ },
-     "metadata": {
-       "skillName": "your_skill_name",
-       "version": "1.0.0",
-       "processingTimeMs": 150,
-       "timestamp": "2024-01-15T10:30:00Z"
-     }
-   }
-   ```
-
-5. **Register Your Skill**
-   ```bash
-   curl -X POST http://localhost:4000/api/skills \
-     -H "Content-Type: application/json" \
-     -H "X-API-Key: openclaw-mesh-default-key" \
-     -d '{
-       "agentId": "your-agent-id",
-       "name": "your_skill_name",
-       "description": "What your skill does",
-       "endpoint": "http://your-agent:3000/skills/your_skill"
-     }'
-   ```
-
-### Skill Discovery
-
-Find skills available from other agents:
+All API requests require an API key:
 
 ```bash
-curl http://localhost:4000/api/skills \
+curl -H "X-API-Key: openclaw-mesh-default-key" ...
+```
+
+**Default API Key:** `openclaw-mesh-default-key`
+
+**Set Custom Key:**
+```bash
+export AGENT_MESH_API_KEY="your-custom-key"
+npm start
+```
+
+---
+
+## 🎯 Auto-Update System
+
+### Key Feature: No Re-Registration Required!
+
+**Problem:** Previous systems required agents to re-register with new IDs after updates, causing:
+- Duplicate agent records
+- Lost message history
+- Broken capabilities tracking
+- Confusing agent management
+
+**Solution:** Agent Mesh v2.0.0+ uses **name-based identity persistence**:
+
+1. **First Registration:** Agent gets UUID based on name
+2. **Re-Registration:** Same name = same UUID (identity preserved)
+3. **Auto-Update:** Agents update and re-register without ID changes
+
+### How It Works
+
+```bash
+# First registration
+curl -X POST http://localhost:4000/api/agents/register \
+  -H "X-API-Key: openclaw-mesh-default-key" \
+  -d '{"name": "DuckBot", "endpoint": "http://localhost:3000"}'
+# Response: agentId = "cc5afd10-ca32-4514-85f9-2558c70f2164"
+
+# Re-registration (after update)
+curl -X POST http://localhost:4000/api/agents/register \
+  -H "X-API-Key: openclaw-mesh-default-key" \
+  -d '{"name": "DuckBot", "endpoint": "http://localhost:3001"}'
+# Response: agentId = "cc5afd10-ca32-4514-85f9-2558c70f2164" (SAME ID!)
+```
+
+### Auto-Update Client
+
+```bash
+node auto-update-client.js \
+  --agent-name "MyAgent" \
+  --endpoint "http://localhost:3000" \
+  --version "1.0.0"
+```
+
+**Features:**
+- ✅ Real-time update notifications via WebSocket
+- ✅ Automatic update acknowledgment
+- ✅ Version compatibility checking
+- ✅ Breaking change warnings
+- ✅ Custom update logic support
+
+**Full Documentation:** See [AUTO-UPDATE-README.md](AUTO-UPDATE-README.md)
+
+---
+
+## 📊 Examples
+
+### Discover Agents by Capability
+
+```bash
+curl "http://localhost:4000/api/agents?capability=web_search" \
   -H "X-API-Key: openclaw-mesh-default-key"
 ```
 
-### Skill Invocation
-
-Invoke a skill on another agent:
+### Upload File
 
 ```bash
-curl -X POST http://localhost:4000/api/skills/{skillId}/invoke \
+FILE_DATA=$(base64 -w 0 myfile.txt)
+curl -X POST http://localhost:4000/api/files/upload \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: openclaw-mesh-default-key" \
+  -d "{
+    \"agentId\": \"cc5afd10-ca32-4514-85f9-2558c70f2164\",
+    \"filename\": \"myfile.txt\",
+    \"fileType\": \"text/plain\",
+    \"fileData\": \"$FILE_DATA\",
+    \"description\": \"Important document\"
+  }"
+```
+
+### Create System Update
+
+```bash
+curl -X POST http://localhost:4000/api/updates \
   -H "Content-Type: application/json" \
   -H "X-API-Key: openclaw-mesh-default-key" \
   -d '{
-    "from": "your-agent-id",
-    "payload": { "param1": "value1" }
+    "version": "2.0.0",
+    "updateType": "feature",
+    "title": "File Transfer System",
+    "description": "Agents can now share files",
+    "breakingChange": false
   }'
 ```
 
-### Example Skills
+### Report Catastrophe
 
-See the [examples/](./examples/) directory for complete skill implementations:
+```bash
+curl -X POST http://localhost:4000/api/catastrophe \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: openclaw-mesh-default-key" \
+  -d '{
+    "eventType": "server_crash",
+    "severity": "critical",
+    "title": "Server crashed unexpectedly",
+    "description": "Detected crash at 2026-02-08 20:00"
+  }'
+```
 
-- **web_search** - Web search integration
-- **data_process** - Data processing example
-- **file_operations** - File handling example
+### Get Health Dashboard
 
-For more details, see:
-- [Skill Protocol Specification](./SKILL_PROTOCOL.md)
-- [Skill Registration Template](./SKILL_TEMPLATE.md)
-- [OpenClaw Skill Integration](./SKILL.md)
+```bash
+curl http://localhost:4000/api/health/dashboard \
+  -H "X-API-Key: openclaw-mesh-default-key"
+```
 
-## Roadmap
+**Response:**
+```json
+{
+  "totalAgents": 5,
+  "healthy": 3,
+  "degraded": 1,
+  "unhealthy": 0,
+  "offline": 1,
+  "criticalEvents": 0
+}
+```
 
-- [ ] Federation support (connect multiple mesh instances)
-- [ ] Message encryption
-- [ ] Agent groups/channels
-- [ ] Message persistence TTL
-- [ ] REST webhook callbacks
-- [ ] Skill versioning and migrations
-- [ ] Skill marketplace/discovery UI
+---
 
-## License
+## 🗄️ Database
 
-MIT
+**License**
+
+MIT License - Free for use in OpenClaw and other agent systems
+
+---
+
+**Repository:** https://github.com/Franzferdinan51/agent-mesh-api
+
+**Status:** ✅ Production Ready (v2.1.0)
+
+**Last Updated:** 2026-02-10
+
+---
 
 ## Integrations
 
@@ -489,3 +369,104 @@ agent.listen_for_requests()
 1. Create a module in `integrations/`
 2. Implement mesh registration and messaging
 3. Add documentation to `integrations/README.md`
+
+### Tables
+
+- `agents` - Agent registration and metadata
+- `messages` - Inter-agent messages
+- `skills` - Agent skill discovery
+- `agent_files` - File storage (v2.0.0)
+- `system_updates` - Update tracking (v2.0.0)
+- `update_acknowledgments` - Update adoption (v2.0.0)
+- `catastrophe_events` - Incident tracking (v2.0.0)
+- `agent_health_status` - Health metrics (v2.0.0)
+
+---
+
+## 📚 Documentation
+
+- **Full API Reference:** [API_DOCUMENTATION.md](API_DOCUMENTATION.md)
+- **Auto-Update System:** [AUTO-UPDATE-README.md](AUTO-UPDATE-README.md)
+- **Enhancement Plan:** [ENHANCEMENT-PLAN.md](ENHANCEMENT-PLAN.md)
+- **WebSocket Client:** [websocket-client.js](websocket-client.js)
+- **Auto-Update Client:** [auto-update-client.js](auto-update-client.js)
+
+---
+
+## 🛠️ Development
+
+### Run in Development Mode
+
+```bash
+npm run dev
+```
+
+### Run WebSocket Client
+
+```bash
+npm run ws-client
+```
+
+### Test API
+
+```bash
+node test-api.js
+```
+
+---
+
+## 🔒 Security
+
+- API key required for all operations
+- Agent names are unique identifiers
+- CORS enabled for web UI
+- WebSocket connection authentication
+
+---
+
+## 📈 Version History
+
+### v2.1.0 (2026-02-08)
+- ✅ Auto-update client for agents
+- ✅ Identity preservation (no re-registration)
+- ✅ Real-time update notifications
+- ✅ Version compatibility checking
+
+### v2.0.0 (2026-02-08)
+- ✅ File transfer system
+- ✅ System updates
+- ✅ Catastrophe protocols
+- ✅ Health monitoring
+
+### v1.0.0 (2026-02-07)
+- ✅ Agent registration
+- ✅ Messaging system
+- ✅ Heartbeat
+- ✅ WebSocket events
+
+---
+
+## 🤝 Contributing
+
+To contribute:
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Test thoroughly
+5. Submit a pull request
+
+---
+
+## 📄 License
+
+MIT License - Free for use in OpenClaw and other agent systems
+
+---
+
+**Repository:** https://github.com/Franzferdinan51/agent-mesh-api
+
+**Status:** ✅ Production Ready (v2.1.0)
+
+**Last Updated:** 2026-02-08 22:55 EST
+>>>>>>> c32c99e1e49142e3e81bbb7a01e266b7aaaea417
