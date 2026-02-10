@@ -457,3 +457,35 @@ For more details, see:
 ## License
 
 MIT
+
+## Integrations
+
+The Agent Mesh can integrate with external services and tools via the `integrations/` directory.
+
+### ComfyUI Integration
+
+Connect ComfyUI to the mesh for distributed image and video generation.
+
+**Documentation:** [integrations/README.md](./integrations/README.md)
+
+**Features:**
+- Image generation via ComfyUI API
+- Video generation via WAN2.2 model
+- Distributed inference via ComfyUI-Distributed
+- Message-based inference requests
+
+**Usage:**
+```python
+from integrations.comfyui_integration import ComfyUIMeshAgent
+
+agent = ComfyUIMeshAgent(agent_name="ComfyUI-Worker")
+agent.register_with_mesh()
+agent.broadcast_availability()
+agent.listen_for_requests()
+```
+
+### Adding New Integrations
+
+1. Create a module in `integrations/`
+2. Implement mesh registration and messaging
+3. Add documentation to `integrations/README.md`
