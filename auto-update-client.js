@@ -291,7 +291,7 @@ async function main() {
 }
 
 // Parse command line arguments
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (require.main === module) {
   const args = process.argv.slice(2);
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--agent-name' && args[i + 1]) {
