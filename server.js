@@ -23,7 +23,20 @@ const API_KEY = process.env.AGENT_MESH_API_KEY || 'openclaw-mesh-default-key';
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+// Increased JSON body limit to 50MB for file uploads
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+// Global error handlers to prevent crashes
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[ERROR] Unhandled Rejection at:', promise, 'reason:', reason);
+  // Don't exit - just log the error
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('[ERROR] Uncaught Exception:', error);
+  // Don't exit - just log the error
+});
 
 // Optional: Serve the Web UI build (webui/dist)
 // This is convenience for LAN/Tailscale usage.
@@ -1631,8 +1644,14 @@ async function checkMessageTimeouts() {
   }
 }
 
-// Run timeout check every minute
-setInterval(checkMessageTimeouts, 60000);
+// Run timeout check every minute with error handling
+setInterval(() => {
+  try {
+    checkMessageTimeouts();
+  } catch (error) {
+    console.error('[Interval] Error in checkMessageTimeouts:', error);
+  }
+}, 60000);
 
 // Health check
 app.get('/health', (req, res) => {
@@ -1646,6 +1665,13 @@ app.get('/health', (req, res) => {
 // === WEBSOCKET ===
 
 const server = http.createServer(app);
+
+// Error handler for HTTP server
+server.on('error', (error) => {
+  console.error('[SERVER] HTTP Server error:', error);
+});
+
+
 const wss = new WebSocketServer({ server, path: '/ws' });
 
 const clients = new Map();
@@ -1654,7 +1680,11 @@ function broadcast(data) {
   const message = JSON.stringify(data);
   wss.clients.forEach(client => {
     if (client.readyState === 1) { // WebSocket.OPEN
-      client.send(message);
+      try {
+        client.send(message);
+      } catch (error) {
+        console.error('[Broadcast] Error sending to client:', error.message);
+      }
     }
   });
 }
@@ -1705,7 +1735,8 @@ wss.on('connection', (ws, req) => {
 async function start() {
   await initDb();
   
-  server.listen(PORT, () => {
+  const HOST = process.env.HOST || '0.0.0.0';
+server.listen(PORT, HOST, () => {
     console.log(`
 ╔══════════════════════════════════════════════════════════╗
 ║  Agent Mesh API Server                                   ║
