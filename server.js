@@ -23,9 +23,9 @@ const API_KEY = process.env.AGENT_MESH_API_KEY || 'openclaw-mesh-default-key';
 
 // Middleware
 app.use(cors());
-// Increased JSON body limit to 50MB for file uploads
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+// Unlimited JSON body limit for file uploads
+app.use(express.json({ limit: 'unlimited' }));
+app.use(express.urlencoded({ limit: 'unlimited', extended: true }));
 
 // Global error handlers to prevent crashes
 process.on('unhandledRejection', (reason, promise) => {
