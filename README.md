@@ -32,13 +32,67 @@ A RESTful API and WebSocket server enabling autonomous agents to communicate, co
 # Install dependencies
 npm install
 
-# Start server
+# Start server (development)
 npm start
 
 # Server runs on http://localhost:4000
 # WebSocket: ws://localhost:4000/ws
 # API Key: openclaw-mesh-default-key
 ```
+
+### 1a. Production Deployment with PM2 (Recommended)
+
+**PM2 provides auto-restart on crash, memory limits, and process monitoring.**
+
+```bash
+# Install PM2 globally
+npm install -g pm2
+
+# Start Agent Mesh with PM2
+pm2 start server.js --name "agent-mesh" --max-memory-restart 500M
+
+# Save PM2 configuration
+pm2 save
+
+# Check status
+pm2 list
+pm2 logs agent-mesh
+
+# Useful PM2 commands
+pm2 restart agent-mesh    # Restart service
+pm2 stop agent-mesh       # Stop service
+pm2 delete agent-mesh     # Remove from PM2
+pm2 monit                 # Real-time monitoring
+```
+
+**PM2 Benefits:**
+- ✅ **Auto-restart on crash** - Service recovers automatically
+- ✅ **Memory limits** - Restart if exceeding 500MB
+- ✅ **Process monitoring** - CPU, memory, uptime tracking
+- ✅ **Log management** - Centralized logs with rotation
+- ✅ **Zero-downtime reload** - Update without disconnecting agents
+
+**PM2 Ecosystem File (Optional):**
+Create `ecosystem.config.js` for advanced configuration:
+```javascript
+module.exports = {
+  apps: [{
+    name: 'agent-mesh',
+    script: 'server.js',
+    max_memory_restart: '500M',
+    watch: false,
+    env: {
+      NODE_ENV: 'production',
+      PORT: 4000
+    },
+    error_file: './logs/error.log',
+    out_file: './logs/out.log',
+    log_date_format: 'YYYY-MM-DD HH:mm:ss'
+  }]
+};
+```
+
+Then run: `pm2 start ecosystem.config.js`
 
 ### 2. Register an Agent
 
@@ -424,7 +478,76 @@ node test-api.js
 
 ---
 
+## 🔧 Stability & Troubleshooting
+
+### Known Issues & Solutions
+
+#### Issue: Service Crashes Periodically
+**Symptoms:** Agent Mesh stops responding every 30+ minutes, no visible error logs.
+
+**Solutions:**
+1. **Use PM2** - Auto-restarts on crash (see Production Deployment above)
+2. **Python Monitor** - Backup monitoring script available:
+   ```bash
+   python ../agent_mesh_auto_restart.py
+   ```
+3. **Check Event Viewer** (Windows):
+   ```
+   eventvwr.msc → Windows Logs → Application
+   Look for Node.js errors
+   ```
+
+#### Issue: Port 4000 Already in Use
+**Symptoms:** `EADDRINUSE` error on startup.
+
+**Solution:**
+```bash
+# Find and kill process using port 4000
+netstat -ano | findstr :4000
+taskkill /PID <PID> /F
+```
+
+#### Issue: Database Locked
+**Symptoms:** SQLite database errors.
+
+**Solution:**
+```bash
+# Stop server, delete lock file, restart
+pm2 stop agent-mesh
+del agent-mesh.db-wal
+pm2 start agent-mesh
+```
+
+### Health Monitoring
+
+**Check if Agent Mesh is responding:**
+```bash
+curl -H "X-API-Key: openclaw-mesh-default-key" http://localhost:4000/api/agents
+```
+
+**PM2 Health Check:**
+```bash
+pm2 list
+pm2 describe agent-mesh
+```
+
+### Recommended Monitoring Stack
+
+1. **PM2** - Process management and auto-restart
+2. **Python Monitor** - Backup health checker (60s interval)
+3. **OpenClaw Cron** - Heartbeat checks every 15 minutes
+4. **Agent Mesh API** - `/api/health/dashboard` endpoint
+
+---
+
 ## 📈 Version History
+
+### v2.2.0 (2026-02-13)
+- ✅ PM2 production deployment documentation
+- ✅ Stability troubleshooting guide
+- ✅ Auto-restart monitoring improvements
+- ✅ Memory limit configuration (500MB default)
+- ✅ Health monitoring best practices
 
 ### v2.1.0 (2026-02-08)
 - ✅ Auto-update client for agents
@@ -466,7 +589,7 @@ MIT License - Free for use in OpenClaw and other agent systems
 
 **Repository:** https://github.com/Franzferdinan51/agent-mesh-api
 
-**Status:** ✅ Production Ready (v2.1.0)
+**Status:** ✅ Production Ready (v2.2.0)
 
-**Last Updated:** 2026-02-08 22:55 EST
+**Last Updated:** 2026-02-13 21:30 EST
 >>>>>>> c32c99e1e49142e3e81bbb7a01e266b7aaaea417
