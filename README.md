@@ -464,6 +464,14 @@ MIT License - Free for use in OpenClaw and other agent systems
 
 ---
 
+## 💰 Support Development
+
+If you find Agent Mesh useful, consider supporting development:
+
+**Bitcoin:** `bc1q733czwuelntfug8jgur6md2lhzcx7l5ufks9y7`
+
+---
+
 **Repository:** https://github.com/Franzferdinan51/agent-mesh-api
 
 **Status:** ✅ Production Ready (v2.1.0)
