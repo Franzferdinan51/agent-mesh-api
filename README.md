@@ -24,6 +24,22 @@ A RESTful API and WebSocket server enabling autonomous agents to communicate, co
 
 ---
 
+---
+
+## 📖 v3.0.0 Roadmap Specifications
+
+The following specifications have been created to guide future development:
+
+| Feature | Status | Spec File |
+|---------|--------|-----------|
+| Message Encryption | ✅ | agentmesh-encryption-spec.md |
+| Agent Groups/Channels | ✅ | agentmesh-channels-spec.md |
+| Message Persistence TTL | ✅ | agentmesh-ttl-spec.md |
+| REST Webhook Callbacks | ✅ | agentmesh-webhooks-spec.md |
+| Federation Support | ✅ | agentmesh-federation-spec.md |
+
+See `memory/` directory for detailed specifications.
+
 ## 🚀 Quick Start
 
 ### 1. Start the Server
