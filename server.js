@@ -91,6 +91,19 @@ async function requireAgent(identifier, fieldName = 'agent') {
   return agent;
 }
 
+async function requireGroup(identifier, fieldName = 'group') {
+  const group = await db.get(
+    'SELECT * FROM agent_groups WHERE id = ? OR name = ? LIMIT 1',
+    [identifier, identifier]
+  );
+  if (!group) {
+    const error = new Error(`${fieldName} not found`);
+    error.statusCode = 404;
+    throw error;
+  }
+  return group;
+}
+
 async function fetchMessages(filters = {}, pagination = { limit: 50, offset: 0 }) {
   const clauses = [];
   const params = [];
@@ -542,7 +555,7 @@ app.delete('/api/agents/:id', requireApiKey, async (req, res) => {
   }
 });
 
-// Heartbeat - update last_seen and optional health metrics
+// Heartbeat - update last_seen and optional health metrics (supports ID or name)
 app.post('/api/agents/:id/heartbeat', requireApiKey, async (req, res) => {
   try {
     const { status = 'healthy', uptimeSeconds, cpuUsage, memoryUsage, customMetrics = {} } = req.body || {};
@@ -551,14 +564,11 @@ app.post('/api/agents/:id/heartbeat', requireApiKey, async (req, res) => {
       return res.status(400).json({ error: `Invalid health status. Must be one of: ${VALID_HEALTH_STATUSES.join(', ')}` });
     }
 
-    const existing = await db.get('SELECT id FROM agents WHERE id = ?', req.params.id);
-    if (!existing) {
-      return res.status(404).json({ error: 'Agent not found' });
-    }
+    const agent = await requireAgent(req.params.id, 'agent');
 
     await db.run(
       'UPDATE agents SET last_seen = CURRENT_TIMESTAMP WHERE id = ?',
-      req.params.id
+      agent.id
     );
 
     await db.run(`
@@ -574,24 +584,24 @@ app.post('/api/agents/:id/heartbeat', requireApiKey, async (req, res) => {
         custom_metrics = excluded.custom_metrics,
         last_updated = CURRENT_TIMESTAMP
     `,
-    [req.params.id, status, uptimeSeconds || null, cpuUsage || null, memoryUsage || null, JSON.stringify(customMetrics)]);
+    [agent.id, status, uptimeSeconds || null, cpuUsage || null, memoryUsage || null, JSON.stringify(customMetrics)]);
 
     broadcast({
       type: 'agent_health_change',
-      agentId: req.params.id,
+      agentId: agent.id,
       status,
       metrics: { uptimeSeconds, cpuUsage, memoryUsage, customMetrics }
     });
 
     res.json({
       success: true,
-      agentId: req.params.id,
+      agentId: agent.id,
       status,
       metrics: { uptimeSeconds, cpuUsage, memoryUsage, customMetrics }
     });
   } catch (error) {
     console.error('[Error] Agent heartbeat:', error);
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -851,7 +861,14 @@ app.get('/api/skills', requireApiKey, async (req, res) => {
 // Invoke skill on another agent
 app.post('/api/skills/:id/invoke', requireApiKey, async (req, res) => {
   try {
-    const { from, payload } = req.body;
+    const fromInput = req.body.from || req.body.fromAgentId || req.body.agentId || req.body.agentName || req.body.agent;
+    const { payload } = req.body;
+
+    if (!fromInput) {
+      return res.status(400).json({ error: 'from agent is required' });
+    }
+
+    const fromAgent = await requireAgent(fromInput, 'from agent');
     const skill = await db.get('SELECT * FROM skills WHERE id = ?', req.params.id);
 
     if (!skill) {
@@ -868,14 +885,14 @@ app.post('/api/skills/:id/invoke', requireApiKey, async (req, res) => {
 
     await db.run(
       'INSERT INTO messages (id, from_agent, to_agent, content, message_type) VALUES (?, ?, ?, ?, ?)',
-      [messageId, from, skill.agent_id, content, 'skill_invocation']
+      [messageId, fromAgent.id, skill.agent_id, content, 'skill_invocation']
     );
 
     broadcast({
       type: 'skill_invoked',
       skillId: skill.id,
       skillName: skill.name,
-      from,
+      from: fromAgent.id,
       to: skill.agent_id
     });
 
@@ -944,14 +961,10 @@ app.get('/api/groups', requireApiKey, async (req, res) => {
   }
 });
 
-// Get specific group details with members
+// Get specific group details with members (supports ID or name)
 app.get('/api/groups/:id', requireApiKey, async (req, res) => {
   try {
-    const group = await db.get('SELECT * FROM agent_groups WHERE id = ?', req.params.id);
-
-    if (!group) {
-      return res.status(404).json({ error: 'Group not found' });
-    }
+    const group = await requireGroup(req.params.id, 'group');
 
     const members = await db.all(`
       SELECT agm.*, a.name, a.endpoint, a.capabilities, a.last_seen
@@ -959,7 +972,7 @@ app.get('/api/groups/:id', requireApiKey, async (req, res) => {
       JOIN agents a ON agm.agent_id = a.id
       WHERE agm.group_id = ?
       ORDER BY agm.joined_at ASC
-    `, req.params.id);
+    `, group.id);
 
     res.json({
       ...group,
@@ -983,19 +996,12 @@ app.post('/api/groups/:groupId/members', requireApiKey, async (req, res) => {
       return res.status(400).json({ error: 'agentId is required' });
     }
 
-    // Verify group exists
-    const group = await db.get('SELECT id FROM agent_groups WHERE id = ?', req.params.groupId);
-    if (!group) {
-      return res.status(404).json({ error: 'Group not found' });
-    }
-
-    // Verify agent exists
+    const group = await requireGroup(req.params.groupId, 'group');
     const agent = await requireAgent(agentId, 'agent');
 
-    // Check if already a member
     const existing = await db.get(
       'SELECT * FROM agent_group_members WHERE group_id = ? AND agent_id = ?',
-      [req.params.groupId, agent.id]
+      [group.id, agent.id]
     );
 
     if (existing) {
@@ -1004,12 +1010,12 @@ app.post('/api/groups/:groupId/members', requireApiKey, async (req, res) => {
 
     await db.run(
       'INSERT INTO agent_group_members (group_id, agent_id, role) VALUES (?, ?, ?)',
-      [req.params.groupId, agent.id, role]
+      [group.id, agent.id, role]
     );
 
     broadcast({
       type: 'group_member_added',
-      groupId: req.params.groupId,
+      groupId: group.id,
       agentId: agent.id,
       agentName: agent.name,
       role
@@ -1025,12 +1031,14 @@ app.post('/api/groups/:groupId/members', requireApiKey, async (req, res) => {
   }
 });
 
-// Remove agent from group
+// Remove agent from group (supports agent name for :agentId)
 app.delete('/api/groups/:groupId/members/:agentId', requireApiKey, async (req, res) => {
   try {
+    const group = await requireGroup(req.params.groupId, 'group');
+    const agent = await requireAgent(req.params.agentId, 'agent');
     const result = await db.run(
       'DELETE FROM agent_group_members WHERE group_id = ? AND agent_id = ?',
-      [req.params.groupId, req.params.agentId]
+      [group.id, agent.id]
     );
 
     if (result.changes === 0) {
@@ -1039,8 +1047,8 @@ app.delete('/api/groups/:groupId/members/:agentId', requireApiKey, async (req, r
 
     broadcast({
       type: 'group_member_removed',
-      groupId: req.params.groupId,
-      agentId: req.params.agentId
+      groupId: group.id,
+      agentId: agent.id
     });
 
     res.json({
@@ -1076,13 +1084,14 @@ app.get('/api/agents/:agentId/groups', requireApiKey, async (req, res) => {
 // Discover agents in a group (for targeting)
 app.get('/api/groups/:groupId/agents', requireApiKey, async (req, res) => {
   try {
+    const group = await requireGroup(req.params.groupId, 'group');
     const agents = await db.all(`
       SELECT a.*, agm.role
       FROM agents a
       JOIN agent_group_members agm ON a.id = agm.agent_id
       WHERE agm.group_id = ?
       ORDER BY a.name ASC
-    `, req.params.groupId);
+    `, group.id);
 
     res.json(agents.map(a => ({
       ...a,
@@ -1117,11 +1126,11 @@ app.post('/api/groups/:groupId/broadcast', requireApiKey, async (req, res) => {
     }
 
     const messageIds = [];
-    for (const agent of agents) {
+    for (const agentRecord of agents) {
       const id = uuidv4();
       await db.run(
         'INSERT INTO messages (id, from_agent, to_agent, content, message_type, status, timeout_ms) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [id, fromAgent.id, agent.agent_id, content, messageType, 'delivered', DEFAULT_MESSAGE_TIMEOUT_MS]
+        [id, fromAgent.id, agentRecord.agent_id, content, messageType, 'delivered', DEFAULT_MESSAGE_TIMEOUT_MS]
       );
       messageIds.push(id);
     }
@@ -1158,44 +1167,41 @@ app.post('/api/groups/:groupId/memory', requireApiKey, async (req, res) => {
       return res.status(400).json({ error: 'agentId, key, and value are required' });
     }
 
+    const group = await requireGroup(req.params.groupId, 'group');
     const agent = await requireAgent(agentInput, 'agent');
 
-    // Verify group exists and agent is a member
     const membership = await db.get(
       'SELECT * FROM agent_group_members WHERE group_id = ? AND agent_id = ?',
-      [req.params.groupId, agent.id]
+      [group.id, agent.id]
     );
 
     if (!membership) {
       return res.status(403).json({ error: 'Agent is not a member of this group' });
     }
 
-    // Check if memory key already exists
     const existing = await db.get(
       'SELECT * FROM collective_memory WHERE group_id = ? AND key = ?',
-      [req.params.groupId, key]
+      [group.id, key]
     );
 
     let memoryId;
     if (existing) {
-      // Update existing memory with version increment
       memoryId = existing.id;
       await db.run(
         'UPDATE collective_memory SET value = ?, agent_id = ?, memory_type = ?, version = version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
         [JSON.stringify(value), agent.id, memoryType, memoryId]
       );
     } else {
-      // Create new memory entry
       memoryId = uuidv4();
       await db.run(
         'INSERT INTO collective_memory (id, group_id, agent_id, key, value, memory_type) VALUES (?, ?, ?, ?, ?, ?)',
-        [memoryId, req.params.groupId, agent.id, key, JSON.stringify(value), memoryType]
+        [memoryId, group.id, agent.id, key, JSON.stringify(value), memoryType]
       );
     }
 
     broadcast({
       type: 'memory_updated',
-      groupId: req.params.groupId,
+      groupId: group.id,
       memoryId,
       key,
       agentId: agent.id
@@ -1215,9 +1221,10 @@ app.post('/api/groups/:groupId/memory', requireApiKey, async (req, res) => {
 // Get all memory keys for a group
 app.get('/api/groups/:groupId/memory', requireApiKey, async (req, res) => {
   try {
+    const group = await requireGroup(req.params.groupId, 'group');
     const { keys, memoryType } = req.query;
     let query = 'SELECT * FROM collective_memory WHERE group_id = ?';
-    const params = [req.params.groupId];
+    const params = [group.id];
 
     if (memoryType) {
       query += ' AND memory_type = ?';
@@ -1236,19 +1243,20 @@ app.get('/api/groups/:groupId/memory', requireApiKey, async (req, res) => {
 
     res.json(memories.map(m => ({
       ...m,
-      value: JSON.parse(m.value)
+      value: parseJson(m.value, {})
     })));
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
 // Get specific memory key
 app.get('/api/groups/:groupId/memory/:key', requireApiKey, async (req, res) => {
   try {
+    const group = await requireGroup(req.params.groupId, 'group');
     const memory = await db.get(
       'SELECT * FROM collective_memory WHERE group_id = ? AND key = ?',
-      [req.params.groupId, req.params.key]
+      [group.id, req.params.key]
     );
 
     if (!memory) {
@@ -1257,10 +1265,10 @@ app.get('/api/groups/:groupId/memory/:key', requireApiKey, async (req, res) => {
 
     res.json({
       ...memory,
-      value: JSON.parse(memory.value)
+      value: parseJson(memory.value, {})
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -1273,12 +1281,12 @@ app.delete('/api/groups/:groupId/memory/:key', requireApiKey, async (req, res) =
       return res.status(400).json({ error: 'agentId is required' });
     }
 
+    const group = await requireGroup(req.params.groupId, 'group');
     const agent = await requireAgent(agentInput, 'agent');
 
-    // Verify membership
     const membership = await db.get(
       'SELECT * FROM agent_group_members WHERE group_id = ? AND agent_id = ?',
-      [req.params.groupId, agent.id]
+      [group.id, agent.id]
     );
 
     if (!membership) {
@@ -1287,7 +1295,7 @@ app.delete('/api/groups/:groupId/memory/:key', requireApiKey, async (req, res) =
 
     const result = await db.run(
       'DELETE FROM collective_memory WHERE group_id = ? AND key = ?',
-      [req.params.groupId, req.params.key]
+      [group.id, req.params.key]
     );
 
     if (result.changes === 0) {
@@ -1296,7 +1304,7 @@ app.delete('/api/groups/:groupId/memory/:key', requireApiKey, async (req, res) =
 
     broadcast({
       type: 'memory_deleted',
-      groupId: req.params.groupId,
+      groupId: group.id,
       key: req.params.key,
       agentId: agent.id
     });
@@ -1313,11 +1321,10 @@ app.delete('/api/groups/:groupId/memory/:key', requireApiKey, async (req, res) =
 // Get memory history (versions) for a key
 app.get('/api/groups/:groupId/memory/:key/history', requireApiKey, async (req, res) => {
   try {
-    // For full version history, we'd need a separate version table
-    // For now, return current version info
+    const group = await requireGroup(req.params.groupId, 'group');
     const memory = await db.get(
       'SELECT * FROM collective_memory WHERE group_id = ? AND key = ?',
-      [req.params.groupId, req.params.key]
+      [group.id, req.params.key]
     );
 
     if (!memory) {
@@ -1331,7 +1338,7 @@ app.get('/api/groups/:groupId/memory/:key/history', requireApiKey, async (req, r
       lastUpdatedBy: memory.agent_id
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -1883,7 +1890,7 @@ app.post('/api/catastrophe/:id/resolve', requireApiKey, async (req, res) => {
 
 // === ENHANCED HEALTH MONITORING ===
 
-// Enhanced health report endpoint
+// Enhanced health report endpoint (supports ID or name)
 app.post('/api/agents/:id/health', requireApiKey, async (req, res) => {
   try {
     const { status = 'healthy', uptimeSeconds, cpuUsage, memoryUsage, customMetrics = {} } = req.body || {};
@@ -1892,12 +1899,9 @@ app.post('/api/agents/:id/health', requireApiKey, async (req, res) => {
       return res.status(400).json({ error: `Invalid health status. Must be one of: ${VALID_HEALTH_STATUSES.join(', ')}` });
     }
 
-    const existing = await db.get('SELECT id FROM agents WHERE id = ?', req.params.id);
-    if (!existing) {
-      return res.status(404).json({ error: 'Agent not found' });
-    }
+    const agent = await requireAgent(req.params.id, 'agent');
 
-    await db.run('UPDATE agents SET last_seen = CURRENT_TIMESTAMP WHERE id = ?', req.params.id);
+    await db.run('UPDATE agents SET last_seen = CURRENT_TIMESTAMP WHERE id = ?', agent.id);
     await db.run(
       `INSERT INTO agent_health_status
        (agent_id, status, last_heartbeat, uptime_seconds, cpu_usage, memory_usage, custom_metrics, last_updated)
@@ -1910,27 +1914,27 @@ app.post('/api/agents/:id/health', requireApiKey, async (req, res) => {
          memory_usage = excluded.memory_usage,
          custom_metrics = excluded.custom_metrics,
          last_updated = CURRENT_TIMESTAMP`,
-      [req.params.id, status, uptimeSeconds || null, cpuUsage || null, memoryUsage || null, JSON.stringify(customMetrics)]
+      [agent.id, status, uptimeSeconds || null, cpuUsage || null, memoryUsage || null, JSON.stringify(customMetrics)]
     );
 
-    // Broadcast health status change
     broadcast({
       type: 'agent_health_change',
-      agentId: req.params.id,
+      agentId: agent.id,
       status,
       metrics: { uptimeSeconds, cpuUsage, memoryUsage, customMetrics }
     });
 
     res.json({ success: true, message: 'Health status updated', status });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
-// Get agent health details
+// Get agent health details (supports ID or name)
 app.get('/api/agents/:id/health', requireApiKey, async (req, res) => {
   try {
-    const health = await db.get('SELECT * FROM agent_health_status WHERE agent_id = ?', req.params.id);
+    const agent = await requireAgent(req.params.id, 'agent');
+    const health = await db.get('SELECT * FROM agent_health_status WHERE agent_id = ?', agent.id);
 
     if (!health) {
       return res.status(404).json({ error: 'Health status not found' });
@@ -1943,11 +1947,11 @@ app.get('/api/agents/:id/health', requireApiKey, async (req, res) => {
       uptimeSeconds: health.uptime_seconds,
       cpuUsage: health.cpu_usage,
       memoryUsage: health.memory_usage,
-      customMetrics: JSON.parse(health.custom_metrics || '{}'),
+      customMetrics: parseJson(health.custom_metrics, {}),
       lastUpdated: health.last_updated
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 

@@ -4,31 +4,35 @@
 
 A REST API, WebSocket event bus, and MCP sidecar for autonomous agents that need to communicate, collaborate, and share resources across a distributed mesh.
 
-Built before OpenClaw existed, now updated to play nicer with OpenClaw-style runtimes and tooling:
-- agent lookup by either ID or name on key endpoints
-- `X-API-Key` and `Authorization: Bearer ...` auth support
-- OpenClaw-friendly health and compatibility endpoints
-- MCP wrapper that registers itself and speaks the current REST API cleanly
+**v3.0.0 — OpenClaw compatibility refresh** (2026-04-19): Full bug pass, name-or-ID resolution on all endpoints, OpenClaw compatibility endpoints, structured health/stats APIs.
 
 ---
 
 ## 🎯 Features
 
 ### Core Features
-- ✅ **Agent Registration:** Register and discover agents across the mesh
-- ✅ **Messaging:** Send messages between agents
+- ✅ **Agent Registration:** Register and discover agents across the mesh (name-based identity persistence)
+- ✅ **Messaging:** Send/receive messages between agents by ID or name
 - ✅ **Heartbeat:** Track agent availability and status
 - ✅ **WebSocket:** Real-time event broadcasting
 - ✅ **Skill Discovery:** Query agent capabilities
+- ✅ **Agent Groups:** Create groups, add/remove members, group broadcasts
+- ✅ **Collective Memory:** Shared key-value store per group with versioning
 
 ### v2.0.0 Enhancements
-- ✅ **File Transfer:** Share documents, code, and resources
-- ✅ **System Updates:** Centralized update management
+- ✅ **File Transfer:** Share documents, code, and resources (Base64 upload/download)
+- ✅ **System Updates:** Centralized update announcements with acknowledgments
 - ✅ **Catastrophe Protocols:** Documented recovery procedures
 - ✅ **Health Monitoring:** Real-time agent health dashboard
-- ✅ **Auto-Update System:** Agents can update without re-registration
+- ✅ **Auto-Update System:** Agents update without re-registration (identity preserved)
 
----
+### v3.0.0 OpenClaw Compatibility
+- ✅ **Name-or-ID resolution:** All agent and group endpoints accept ID or name
+- ✅ **Bearer token auth:** Both `X-API-Key` and `Authorization: Bearer` supported
+- ✅ **OpenClaw compatibility descriptor:** `GET /api/openclaw/compat`
+- ✅ **Structured health:** `GET /api/health` (authenticated), `GET /api/stats`
+- ✅ **MCP sidecar:** Full REST contract, rich tool descriptions, `limit` params
+- ✅ **Bug fixes:** Route ordering, error handling, group membership checks
 
 ---
 
@@ -486,6 +490,16 @@ node test-api.js
 
 ## 📈 Version History
 
+### v3.0.0 (2026-04-19)
+- ✅ Full name-or-ID resolution on all endpoints via `requireAgent()` and `requireGroup()` helpers
+- ✅ `requireApiKey` middleware supports both `X-API-Key` and `Authorization: Bearer ...` headers
+- ✅ `GET /api/health` (authenticated), `GET /api/openclaw/compat` for OpenClaw integration
+- ✅ Fixed route ordering: `/api/messages/by-id/:id` correctly placed before `/api/messages/:agentId`
+- ✅ Group membership verified on all collective memory operations
+- ✅ All endpoints use consistent error handling with `statusCode` propagation
+- ✅ MCP sidecar: all tools now use real REST API contract with proper params and return types
+- ✅ Version bumped to 3.0.0
+
 ### v2.1.0 (2026-02-08)
 - ✅ Auto-update client for agents
 - ✅ Identity preservation (no re-registration)
@@ -534,6 +548,6 @@ If you find Agent Mesh useful, consider supporting development:
 
 **Repository:** https://github.com/Franzferdinan51/agent-mesh-api
 
-**Status:** ✅ Production Ready (v2.1.0)
+**Status:** ✅ Production Ready (v3.0.0)
 
-**Last Updated:** 2026-04-19 00:00 EDT
+**Last Updated:** 2026-04-19 01:00 EDT
