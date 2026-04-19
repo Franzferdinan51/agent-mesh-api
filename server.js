@@ -420,6 +420,66 @@ app.post('/api/agents/register', requireApiKey, async (req, res) => {
   }
 });
 
+// Bulk register — register multiple agents in one call (spawning teams)
+app.post('/api/agents/bulk-register', requireApiKey, async (req, res) => {
+  try {
+    const { agents } = req.body;
+
+    if (!Array.isArray(agents) || agents.length === 0) {
+      return res.status(400).json({ error: 'agents array is required' });
+    }
+
+    if (agents.length > 50) {
+      return res.status(400).json({ error: 'Maximum 50 agents per bulk registration' });
+    }
+
+    const results = [];
+    const errors = [];
+
+    for (let i = 0; i < agents.length; i++) {
+      const { name, endpoint, capabilities } = agents[i];
+
+      if (!name) {
+        errors.push({ index: i, error: 'name is required' });
+        continue;
+      }
+
+      try {
+        const existing = await db.get('SELECT id, name FROM agents WHERE name = ?', name);
+
+        if (existing) {
+          await db.run(
+            'UPDATE agents SET endpoint = ?, capabilities = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?',
+            [endpoint || existing.endpoint, JSON.stringify(capabilities || []), existing.id]
+          );
+          results.push({ index: i, name, agentId: existing.id, existed: true });
+        } else {
+          const id = uuidv4();
+          await db.run(
+            'INSERT INTO agents (id, name, endpoint, capabilities) VALUES (?, ?, ?, ?)',
+            [id, name, endpoint || null, JSON.stringify(capabilities || [])]
+          );
+          broadcast({ type: 'agent_joined', agent: { id, name, endpoint, capabilities } });
+          results.push({ index: i, name, agentId: id, existed: false });
+        }
+      } catch (err) {
+        errors.push({ index: i, name, error: err.message });
+      }
+    }
+
+    res.json({
+      success: true,
+      registered: results.length,
+      failed: errors.length,
+      results,
+      errors: errors.length > 0 ? errors : undefined
+    });
+  } catch (error) {
+    console.error('[Error] Bulk register:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // List agents
 app.get('/api/agents', requireApiKey, async (req, res) => {
   try {
@@ -601,6 +661,66 @@ app.post('/api/agents/:id/heartbeat', requireApiKey, async (req, res) => {
     });
   } catch (error) {
     console.error('[Error] Agent heartbeat:', error);
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+// Lightweight ping — check if an agent is alive (avoids full health report overhead)
+app.post('/api/agents/ping/:id', requireApiKey, async (req, res) => {
+  try {
+    const agent = await requireAgent(req.params.id, 'agent');
+    const pongAt = new Date().toISOString();
+
+    broadcast({
+      type: 'agent_ping',
+      agentId: agent.id,
+      agentName: agent.name,
+      pongAt
+    });
+
+    res.json({
+      success: true,
+      agentId: agent.id,
+      agentName: agent.name,
+      pong: true,
+      pongAt
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+// === CAPABILITY DISCOVERY ===
+
+// Get aggregated capability index — useful for multi-agent routing (e.g. Agent-Teams hive-router)
+app.get('/api/capabilities', requireApiKey, async (req, res) => {
+  try {
+    const { agentId } = req.query;
+
+    let agents;
+    if (agentId) {
+      const agent = await requireAgent(agentId, 'agent');
+      agents = [agent];
+    } else {
+      agents = await db.all('SELECT id, name, capabilities FROM agents');
+    }
+
+    const index = {};
+    for (const agent of agents) {
+      const caps = parseJson(agent.capabilities, []);
+      for (const cap of caps) {
+        if (!index[cap]) index[cap] = [];
+        index[cap].push({ id: agent.id, name: agent.name });
+      }
+    }
+
+    res.json({
+      totalCapabilities: Object.keys(index).length,
+      totalAgents: agents.length,
+      index,
+      sorted: Object.keys(index).sort()
+    });
+  } catch (error) {
     res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
@@ -816,6 +936,69 @@ app.post('/api/broadcast', requireApiKey, async (req, res) => {
     });
   } catch (error) {
     console.error('[Error] Broadcast:', error);
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+// Batch message — send multiple messages in one call (multi-agent efficiency)
+app.post('/api/messages/batch', requireApiKey, async (req, res) => {
+  try {
+    const { messages } = req.body;
+
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: 'messages array is required' });
+    }
+
+    if (messages.length > 100) {
+      return res.status(400).json({ error: 'Maximum 100 messages per batch' });
+    }
+
+    const results = [];
+    const errors = [];
+
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      const from = msg.from || msg.fromAgentId || msg.agent;
+      const to = msg.to || msg.toAgentId || msg.recipient;
+      const content = msg.content || msg.message;
+      const messageType = msg.messageType || 'direct';
+      const timeoutMs = toPositiveInt(msg.timeoutMs, DEFAULT_MESSAGE_TIMEOUT_MS, Number.MAX_SAFE_INTEGER);
+
+      if (!from || !to || !content) {
+        errors.push({ index: i, error: 'from, to, and content are required' });
+        continue;
+      }
+
+      try {
+        const fromAgent = await resolveAgent(from);
+        const toAgent = await resolveAgent(to);
+
+        if (!fromAgent) { errors.push({ index: i, error: `from agent not found: ${from}` }); continue; }
+        if (!toAgent) { errors.push({ index: i, error: `to agent not found: ${to}` }); continue; }
+
+        const id = uuidv4();
+        await db.run(
+          'INSERT INTO messages (id, from_agent, to_agent, content, message_type, timeout_ms) VALUES (?, ?, ?, ?, ?, ?)',
+          [id, fromAgent.id, toAgent.id, content, messageType, timeoutMs]
+        );
+
+        results.push({ index: i, messageId: id, from: fromAgent.id, to: toAgent.id });
+      } catch (err) {
+        errors.push({ index: i, error: err.message });
+      }
+    }
+
+    broadcast({ type: 'batch_sent', count: results.length, from: messages[0]?.from });
+
+    res.json({
+      success: true,
+      sent: results.length,
+      failed: errors.length,
+      results,
+      errors: errors.length > 0 ? errors : undefined
+    });
+  } catch (error) {
+    console.error('[Error] Batch message:', error);
     res.status(error.statusCode || 500).json({ error: error.message });
   }
 });

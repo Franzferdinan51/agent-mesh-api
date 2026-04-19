@@ -133,6 +133,34 @@ async function runTests() {
     console.log(`  → Re-registered with same ID: ${agent.agentId}`);
   }));
 
+  // v3.1.0: Bulk register
+  results.push(await test('Bulk register agents', async () => {
+    const result = await post('/api/agents/bulk-register', {
+      agents: [
+        { name: 'BulkAgent1', capabilities: ['research'] },
+        { name: 'BulkAgent2', capabilities: ['coding'] }
+      ]
+    });
+    if (result.registered !== 2) throw new Error(`Expected 2 registered, got ${result.registered}`);
+    console.log(`  → Registered ${result.registered} agents`);
+  }));
+
+  // v3.1.0: Capability index
+  results.push(await test('Get capability index', async () => {
+    const caps = await get('/api/capabilities');
+    if (!caps.index) throw new Error('Expected index field');
+    if (!Array.isArray(caps.sorted)) throw new Error('Expected sorted array');
+    console.log(`  → ${caps.totalCapabilities} capabilities across ${caps.totalAgents} agents`);
+  }));
+
+  // v3.1.0: Agent ping
+  results.push(await test('Ping agent', async () => {
+    const pong = await post(`/api/agents/ping/${testAgent1}`, {});
+    if (!pong.pong) throw new Error('Expected pong=true');
+    if (!pong.pongAt) throw new Error('Expected pongAt timestamp');
+    console.log(`  → Pong from ${pong.agentName}`);
+  }));
+
   // Test agent groups
   results.push(await test('Create agent group', async () => {
     const group = await post('/api/groups', {
@@ -233,6 +261,20 @@ async function runTests() {
   results.push(await test('Filter memory by keys', async () => {
     const memories = await get(`/api/groups/${testGroup}/memory?keys=test_config,project_status`);
     if (memories.length !== 2) throw new Error('Expected 2 memories');
+  }));
+
+  // v3.1.0: Batch messaging
+  results.push(await test('Send batch messages', async () => {
+    const result = await post('/api/messages/batch', {
+      messages: [
+        { from: 'TestAgent1', to: 'TestAgent2', content: 'Batch message 1' },
+        { from: 'TestAgent1', to: 'BulkAgent1', content: 'Batch message 2' },
+        { from: 'BulkAgent1', to: 'TestAgent2', content: 'Batch message 3' }
+      ]
+    });
+    if (result.sent !== 3) throw new Error(`Expected 3 sent, got ${result.sent}`);
+    if (result.failed !== 0) throw new Error(`Expected 0 failed, got ${result.failed}`);
+    console.log(`  → Sent ${result.sent} messages in one call`);
   }));
 
   // Test group broadcasting

@@ -123,21 +123,27 @@ node auto-update-client.js \
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/api/agents/register` | Register or re-register agent (identity preserved) |
+| POST | `/api/agents/bulk-register` | Bulk-register up to 50 agents at once (for spawning teams) |
 | GET | `/api/agents` | List agents, with pagination and optional capability/search filters |
-| GET | `/api/agents/:id` | Get agent details by ID |
+| GET | `/api/agents/:id` | Get agent details by ID or name |
 | PUT | `/api/agents/:id` | Update agent information |
 | DELETE | `/api/agents/:id` | Delete agent |
 | POST | `/api/agents/:id/heartbeat` | Update last_seen and optional health metrics |
 | POST | `/api/agents/:id/health` | Report health metrics |
 | GET | `/api/agents/:id/health` | Get health details |
+| POST | `/api/agents/ping/:id` | Lightweight ping — check if agent is alive (WebSocket broadcast) |
+| GET | `/api/capabilities` | Aggregated capability index across all agents (for routing) |
 
 ### Messaging
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
+| Method | Endpoint | Description |
+|--------|----------|-------------|
 | POST | `/api/messages` | Send message to agent by ID or name |
+| POST | `/api/messages/batch` | Send up to 100 messages in one call (multi-agent efficiency) |
 | GET | `/api/messages` | List messages with filters and pagination |
-| GET | `/api/messages/:id` | Get message details |
+| GET | `/api/messages/by-id/:id` | Get message details by ID |
 | GET | `/api/agents/:id/messages` | Get messages for specific agent |
 | GET | `/api/agents/:id/inbox` | Get agent's inbox |
 | GET | `/api/messages/:agentId/failed` | Get failed or timed out messages for an agent |
@@ -490,6 +496,13 @@ node test-api.js
 
 ## 📈 Version History
 
+### v3.1.0 (2026-04-19)
+- ✅ `GET /api/capabilities` — aggregated capability index for multi-agent routing (powers Agent-Teams hive-router)
+- ✅ `POST /api/messages/batch` — send up to 100 messages in one HTTP call (multi-agent efficiency)
+- ✅ `POST /api/agents/bulk-register` — register up to 50 agents at once (spawning teams from AgentTeams)
+- ✅ `POST /api/agents/ping/:id` — lightweight ping with WebSocket broadcast (no full health metrics overhead)
+- ✅ OpenClaw compatibility refresh for Agent-Teams and similar multi-agent programs
+
 ### v3.0.0 (2026-04-19)
 - ✅ Full name-or-ID resolution on all endpoints via `requireAgent()` and `requireGroup()` helpers
 - ✅ `requireApiKey` middleware supports both `X-API-Key` and `Authorization: Bearer ...` headers
@@ -548,6 +561,6 @@ If you find Agent Mesh useful, consider supporting development:
 
 **Repository:** https://github.com/Franzferdinan51/agent-mesh-api
 
-**Status:** ✅ Production Ready (v3.0.0)
+**Status:** ✅ Production Ready (v3.1.0)
 
-**Last Updated:** 2026-04-19 01:00 EDT
+**Last Updated:** 2026-04-19 01:40 EDT
