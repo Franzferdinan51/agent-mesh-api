@@ -90,6 +90,16 @@ async function runTests() {
     if (health.status !== 'ok') throw new Error('Health check failed');
   }));
 
+  results.push(await test('OpenClaw health summary', async () => {
+    const health = await get('/api/health');
+    if (health.status !== 'ok') throw new Error('API health check failed');
+  }));
+
+  results.push(await test('OpenClaw compatibility descriptor', async () => {
+    const compat = await get('/api/openclaw/compat');
+    if (!compat.compatibility?.openclaw) throw new Error('OpenClaw compatibility missing');
+  }));
+
   // Register test agents
   results.push(await test('Register Agent 1', async () => {
     const agent = await post('/api/agents/register', {
@@ -123,6 +133,34 @@ async function runTests() {
     console.log(`  → Re-registered with same ID: ${agent.agentId}`);
   }));
 
+  // v3.1.0: Bulk register
+  results.push(await test('Bulk register agents', async () => {
+    const result = await post('/api/agents/bulk-register', {
+      agents: [
+        { name: 'BulkAgent1', capabilities: ['research'] },
+        { name: 'BulkAgent2', capabilities: ['coding'] }
+      ]
+    });
+    if (result.registered !== 2) throw new Error(`Expected 2 registered, got ${result.registered}`);
+    console.log(`  → Registered ${result.registered} agents`);
+  }));
+
+  // v3.1.0: Capability index
+  results.push(await test('Get capability index', async () => {
+    const caps = await get('/api/capabilities');
+    if (!caps.index) throw new Error('Expected index field');
+    if (!Array.isArray(caps.sorted)) throw new Error('Expected sorted array');
+    console.log(`  → ${caps.totalCapabilities} capabilities across ${caps.totalAgents} agents`);
+  }));
+
+  // v3.1.0: Agent ping
+  results.push(await test('Ping agent', async () => {
+    const pong = await post(`/api/agents/ping/${testAgent1}`, {});
+    if (!pong.pong) throw new Error('Expected pong=true');
+    if (!pong.pongAt) throw new Error('Expected pongAt timestamp');
+    console.log(`  → Pong from ${pong.agentName}`);
+  }));
+
   // Test agent groups
   results.push(await test('Create agent group', async () => {
     const group = await post('/api/groups', {
@@ -147,9 +185,9 @@ async function runTests() {
     console.log(`  → Group: ${group.name}`);
   }));
 
-  results.push(await test('Add agent to group', async () => {
+  results.push(await test('Add agent to group by name', async () => {
     await post(`/api/groups/${testGroup}/members`, {
-      agentId: testAgent2,
+      agentId: 'TestAgent2',
       role: 'member'
     });
   }));
@@ -173,9 +211,9 @@ async function runTests() {
   }));
 
   // Test collective memory
-  results.push(await test('Store collective memory', async () => {
+  results.push(await test('Store collective memory by name', async () => {
     const memory = await post(`/api/groups/${testGroup}/memory`, {
-      agentId: testAgent1,
+      agentId: 'TestAgent1',
       key: 'test_config',
       value: { setting1: 'value1', setting2: 42 },
       memoryType: 'shared'
@@ -195,9 +233,9 @@ async function runTests() {
     if (!Array.isArray(memories)) throw new Error('Expected array of memories');
   }));
 
-  results.push(await test('Update existing memory', async () => {
+  results.push(await test('Update existing memory by name', async () => {
     const memory = await post(`/api/groups/${testGroup}/memory`, {
-      agentId: testAgent2,
+      agentId: 'TestAgent2',
       key: 'test_config',
       value: { setting1: 'updated', setting3: 'new' },
       memoryType: 'shared'
@@ -225,10 +263,24 @@ async function runTests() {
     if (memories.length !== 2) throw new Error('Expected 2 memories');
   }));
 
+  // v3.1.0: Batch messaging
+  results.push(await test('Send batch messages', async () => {
+    const result = await post('/api/messages/batch', {
+      messages: [
+        { from: 'TestAgent1', to: 'TestAgent2', content: 'Batch message 1' },
+        { from: 'TestAgent1', to: 'BulkAgent1', content: 'Batch message 2' },
+        { from: 'BulkAgent1', to: 'TestAgent2', content: 'Batch message 3' }
+      ]
+    });
+    if (result.sent !== 3) throw new Error(`Expected 3 sent, got ${result.sent}`);
+    if (result.failed !== 0) throw new Error(`Expected 0 failed, got ${result.failed}`);
+    console.log(`  → Sent ${result.sent} messages in one call`);
+  }));
+
   // Test group broadcasting
-  results.push(await test('Broadcast to group', async () => {
+  results.push(await test('Broadcast to group by name', async () => {
     const result = await post(`/api/groups/${testGroup}/broadcast`, {
-      from: testAgent1,
+      from: 'TestAgent1',
       content: 'Hello group!',
       messageType: 'direct'
     });
@@ -236,10 +288,10 @@ async function runTests() {
   }));
 
   // Test enhanced messaging with timeout handling
-  results.push(await test('Send message with timeout handling', async () => {
+  results.push(await test('Send message with timeout handling by name', async () => {
     const message = await post('/api/messages', {
-      from: testAgent1,
-      to: testAgent2,
+      from: 'TestAgent1',
+      to: 'TestAgent2',
       content: 'Test message with timeout',
       messageType: 'direct'
     });
@@ -306,9 +358,9 @@ async function runTests() {
   }));
 
   // Test cleanup
-  results.push(await test('Delete memory key', async () => {
+  results.push(await test('Delete memory key by name', async () => {
     await del(`/api/groups/${testGroup}/memory/project_status`, {
-      agentId: testAgent1
+      agentId: 'TestAgent1'
     });
   }));
 

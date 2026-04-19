@@ -1,14 +1,13 @@
 # Agent Mesh MCP Server
 
-Model Context Protocol server for Agent Mesh - enables AI agents to communicate and coordinate across devices.
+MCP wrapper for Agent Mesh, updated to match the current REST API and OpenClaw-style integrations.
 
-## Features
-
-- List all registered agents
-- Send messages between agents
-- Broadcast messages to all agents
-- Check agent health
-- Get agent status
+## What it does
+- lists registered mesh agents
+- sends direct messages by agent name
+- broadcasts to all agents
+- checks mesh-wide health or per-agent health
+- auto-registers the MCP bridge as a sender when it needs to send traffic
 
 ## Requirements
 
@@ -16,65 +15,49 @@ Model Context Protocol server for Agent Mesh - enables AI agents to communicate 
 pip install fastmcp httpx
 ```
 
-## Usage
+## Environment
 
 ```bash
-# Set environment variables
 export AGENT_MESH_URL="http://localhost:4000"
-export AGENT_MESH_KEY="your-api-key"
+export AGENT_MESH_KEY="openclaw-mesh-default-key"
+export AGENT_MESH_SENDER="OpenClaw-MCP"
+```
 
-# Run the server
+## Run
+
+```bash
 python server.py
 ```
 
 ## Tools
+- `list_agents(limit=50)`
+- `mesh_health(agent_name="")`
+- `send_to_agent(agent_name, message)`
+- `broadcast_message(message)`
+- `get_agent_status(limit=50)`
 
-### list_agents
-List all registered agents in the mesh.
-
-### send_to_agent
-Send a message to a specific agent.
-
-### broadcast_message
-Broadcast a message to all agents.
-
-### agent_health
-Check health of specific agent or entire mesh.
-
-### get_agent_status
-Get detailed status of all agents.
-
-## Integrate with AI Agents
-
-Connect this MCP server to Claude, OpenAI, or any MCP-compatible client:
+## OpenClaw example
 
 ```json
 {
   "mcpServers": {
     "agent-mesh": {
-      "command": "python",
-      "args": ["/path/to/server.py"],
+      "command": "python3",
+      "args": ["/absolute/path/to/agent-mesh-api/mcp-servers/agent-mesh-mcp/server.py"],
       "env": {
-        "AGENT_MESH_URL": "http://100.74.88.40:4000",
-        "AGENT_MESH_KEY": "openclaw-mesh-default-key"
+        "AGENT_MESH_URL": "http://localhost:4000",
+        "AGENT_MESH_KEY": "openclaw-mesh-default-key",
+        "AGENT_MESH_SENDER": "OpenClaw-MCP"
       }
     }
   }
 }
 ```
 
-## Example
+## Health checks
 
-```python
-from fastmcp import FastMCP
-
-mcp = FastMCP("Agent Mesh")
-
-@mcp.tool()
-async def ping_agent(agent_name: str) -> str:
-    """Ping a specific agent"""
-    # Implementation...
+```bash
+curl http://localhost:4000/health
+curl -H "X-API-Key: openclaw-mesh-default-key" http://localhost:4000/api/health
+curl -H "X-API-Key: openclaw-mesh-default-key" http://localhost:4000/api/openclaw/compat
 ```
-
----
-Built for DuckBot + Agent Smith multi-agent system.

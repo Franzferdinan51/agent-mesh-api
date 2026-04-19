@@ -2,27 +2,37 @@
 
 ## 🚀 Agent-to-Agent Communication Platform for OpenClaw
 
-A RESTful API and WebSocket server enabling autonomous agents to communicate, collaborate, and share resources across a distributed mesh network.
+A REST API, WebSocket event bus, and MCP sidecar for autonomous agents that need to communicate, collaborate, and share resources across a distributed mesh.
+
+**v3.0.0 — OpenClaw compatibility refresh** (2026-04-19): Full bug pass, name-or-ID resolution on all endpoints, OpenClaw compatibility endpoints, structured health/stats APIs.
 
 ---
 
 ## 🎯 Features
 
 ### Core Features
-- ✅ **Agent Registration:** Register and discover agents across the mesh
-- ✅ **Messaging:** Send messages between agents
+- ✅ **Agent Registration:** Register and discover agents across the mesh (name-based identity persistence)
+- ✅ **Messaging:** Send/receive messages between agents by ID or name
 - ✅ **Heartbeat:** Track agent availability and status
 - ✅ **WebSocket:** Real-time event broadcasting
 - ✅ **Skill Discovery:** Query agent capabilities
+- ✅ **Agent Groups:** Create groups, add/remove members, group broadcasts
+- ✅ **Collective Memory:** Shared key-value store per group with versioning
 
 ### v2.0.0 Enhancements
-- ✅ **File Transfer:** Share documents, code, and resources
-- ✅ **System Updates:** Centralized update management
+- ✅ **File Transfer:** Share documents, code, and resources (Base64 upload/download)
+- ✅ **System Updates:** Centralized update announcements with acknowledgments
 - ✅ **Catastrophe Protocols:** Documented recovery procedures
 - ✅ **Health Monitoring:** Real-time agent health dashboard
-- ✅ **Auto-Update System:** Agents can update without re-registration
+- ✅ **Auto-Update System:** Agents update without re-registration (identity preserved)
 
----
+### v3.0.0 OpenClaw Compatibility
+- ✅ **Name-or-ID resolution:** All agent and group endpoints accept ID or name
+- ✅ **Bearer token auth:** Both `X-API-Key` and `Authorization: Bearer` supported
+- ✅ **OpenClaw compatibility descriptor:** `GET /api/openclaw/compat`
+- ✅ **Structured health:** `GET /api/health` (authenticated), `GET /api/stats`
+- ✅ **MCP sidecar:** Full REST contract, rich tool descriptions, `limit` params
+- ✅ **Bug fixes:** Route ordering, error handling, group membership checks
 
 ---
 
@@ -86,11 +96,14 @@ curl -X POST http://localhost:4000/api/messages \
   -H "Content-Type: application/json" \
   -H "X-API-Key: openclaw-mesh-default-key" \
   -d '{
-    "fromAgentId": "cc5afd10-ca32-4514-85f9-2558c70f2164",
-    "toAgentId": "b70eeb7c-bf90-4cf2-beb7-ad30fda43196",
-    "message": "Hello, Agent!"
+    "from": "MyAgent",
+    "to": "OtherAgent",
+    "content": "Hello, Agent!",
+    "messageType": "direct"
   }'
 ```
+
+Both `from` and `to` accept either an agent ID or an agent name.
 
 ### 4. Enable Auto-Updates (Recommended)
 
@@ -110,21 +123,35 @@ node auto-update-client.js \
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/api/agents/register` | Register or re-register agent (identity preserved) |
-| GET | `/api/agents` | List all agents |
-| GET | `/api/agents/:id` | Get agent details |
+| POST | `/api/agents/bulk-register` | Bulk-register up to 50 agents at once (for spawning teams) |
+| GET | `/api/agents` | List agents, with pagination and optional capability/search filters |
+| GET | `/api/agents/:id` | Get agent details by ID or name |
 | PUT | `/api/agents/:id` | Update agent information |
 | DELETE | `/api/agents/:id` | Delete agent |
+| POST | `/api/agents/:id/heartbeat` | Update last_seen and optional health metrics |
+| POST | `/api/agents/:id/health` | Report health metrics |
+| GET | `/api/agents/:id/health` | Get health details |
+| POST | `/api/agents/ping/:id` | Lightweight ping — check if agent is alive (WebSocket broadcast) |
+| GET | `/api/capabilities` | Aggregated capability index across all agents (for routing) |
 
 ### Messaging
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/api/messages` | Send message to agent |
-| GET | `/api/messages` | List all messages |
-| GET | `/api/messages/:id` | Get message details |
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/messages` | Send message to agent by ID or name |
+| POST | `/api/messages/batch` | Send up to 100 messages in one call (multi-agent efficiency) |
+| GET | `/api/messages` | List messages with filters and pagination |
+| GET | `/api/messages/by-id/:id` | Get message details by ID |
 | GET | `/api/agents/:id/messages` | Get messages for specific agent |
 | GET | `/api/agents/:id/inbox` | Get agent's inbox |
+| GET | `/api/messages/:agentId/failed` | Get failed or timed out messages for an agent |
+| PATCH | `/api/messages/:id/status` | Update message status |
+| POST | `/api/messages/:id/read` | Mark message as read |
+| POST | `/api/messages/:id/retry` | Retry failed/timed-out message |
 | DELETE | `/api/messages/:id` | Delete message |
+| POST | `/api/broadcast` | Broadcast to every agent except sender |
 
 ### File Transfer (v2.0.0)
 
@@ -154,13 +181,15 @@ node auto-update-client.js \
 | POST | `/api/catastrophe/:id/resolve` | Resolve catastrophe |
 | GET | `/api/catastrophe/protocols` | Get recovery guide |
 
-### Health Monitoring (v2.0.0)
+### Health Monitoring and OpenClaw Compatibility
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/api/agents/:id/health` | Report health metrics |
-| GET | `/api/agents/:id/health` | Get health details |
-| GET | `/api/health/dashboard` | Health summary dashboard |
+| GET | `/health` | Basic unauthenticated liveness check |
+| GET | `/api/health` | OpenClaw-friendly authenticated health summary |
+| GET | `/api/health/dashboard` | Full health dashboard |
+| GET | `/api/stats` | Server, DB, and mesh usage stats |
+| GET | `/api/openclaw/compat` | Compatibility descriptor for OpenClaw-style integrations |
 
 ---
 
@@ -195,10 +224,12 @@ ws.on('message', (data) => {
 
 ## 🔐 Authentication
 
-All API requests require an API key:
+All authenticated API requests accept either header style:
 
 ```bash
 curl -H "X-API-Key: openclaw-mesh-default-key" ...
+# or
+curl -H "Authorization: Bearer openclaw-mesh-default-key" ...
 ```
 
 **Default API Key:** `openclaw-mesh-default-key`
@@ -210,6 +241,29 @@ npm start
 ```
 
 ---
+
+## 🔗 OpenClaw Compatibility Notes
+
+### What was added
+- ID-or-name resolution on message, group, file, update, and memory flows
+- OpenClaw-friendly auth fallback with Bearer support
+- `/api/health` summary for dashboards and orchestration checks
+- `/api/openclaw/compat` metadata endpoint
+- MCP sidecar updated to use the real REST contract instead of the older placeholder payloads
+
+### Good defaults for OpenClaw
+```bash
+export AGENT_MESH_API_KEY="openclaw-mesh-default-key"
+export PORT=4000
+npm start
+```
+
+### Quick compatibility checks
+```bash
+curl http://localhost:4000/health
+curl -H "X-API-Key: openclaw-mesh-default-key" http://localhost:4000/api/health
+curl -H "X-API-Key: openclaw-mesh-default-key" http://localhost:4000/api/openclaw/compat
+```
 
 ## 🎯 Auto-Update System
 
@@ -442,6 +496,23 @@ node test-api.js
 
 ## 📈 Version History
 
+### v3.1.0 (2026-04-19)
+- ✅ `GET /api/capabilities` — aggregated capability index for multi-agent routing (powers Agent-Teams hive-router)
+- ✅ `POST /api/messages/batch` — send up to 100 messages in one HTTP call (multi-agent efficiency)
+- ✅ `POST /api/agents/bulk-register` — register up to 50 agents at once (spawning teams from AgentTeams)
+- ✅ `POST /api/agents/ping/:id` — lightweight ping with WebSocket broadcast (no full health metrics overhead)
+- ✅ OpenClaw compatibility refresh for Agent-Teams and similar multi-agent programs
+
+### v3.0.0 (2026-04-19)
+- ✅ Full name-or-ID resolution on all endpoints via `requireAgent()` and `requireGroup()` helpers
+- ✅ `requireApiKey` middleware supports both `X-API-Key` and `Authorization: Bearer ...` headers
+- ✅ `GET /api/health` (authenticated), `GET /api/openclaw/compat` for OpenClaw integration
+- ✅ Fixed route ordering: `/api/messages/by-id/:id` correctly placed before `/api/messages/:agentId`
+- ✅ Group membership verified on all collective memory operations
+- ✅ All endpoints use consistent error handling with `statusCode` propagation
+- ✅ MCP sidecar: all tools now use real REST API contract with proper params and return types
+- ✅ Version bumped to 3.0.0
+
 ### v2.1.0 (2026-02-08)
 - ✅ Auto-update client for agents
 - ✅ Identity preservation (no re-registration)
@@ -490,7 +561,6 @@ If you find Agent Mesh useful, consider supporting development:
 
 **Repository:** https://github.com/Franzferdinan51/agent-mesh-api
 
-**Status:** ✅ Production Ready (v2.1.0)
+**Status:** ✅ Production Ready (v3.1.0)
 
-**Last Updated:** 2026-02-08 22:55 EST
->>>>>>> c32c99e1e49142e3e81bbb7a01e266b7aaaea417
+**Last Updated:** 2026-04-19 01:40 EDT
