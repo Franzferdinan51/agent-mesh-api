@@ -11,36 +11,144 @@ import { v4 as uuidv4 } from 'uuid';
 import sqlite3 from 'sqlite3';
 import { open } from 'sqlite';
 import http from 'http';
+import { existsSync, readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+const APP_VERSION = JSON.parse(readFileSync(join(__dirname, 'package.json'), 'utf8')).version;
 
 const app = express();
 const PORT = process.env.PORT || 4000;
 const API_KEY = process.env.AGENT_MESH_API_KEY || 'openclaw-mesh-default-key';
+const DB_PATH = process.env.AGENT_MESH_DB_PATH || join(__dirname, 'agent-mesh.db');
+const BODY_LIMIT = process.env.AGENT_MESH_BODY_LIMIT || '12mb';
+const OFFLINE_THRESHOLD_MINUTES = parseInt(process.env.AGENT_MESH_OFFLINE_MINUTES || '5', 10);
+const DEFAULT_MESSAGE_TIMEOUT_MS = parseInt(process.env.MESSAGE_TIMEOUT || '300000', 10);
+const MESSAGE_TIMEOUT_CHECK_INTERVAL_MS = parseInt(process.env.MESSAGE_TIMEOUT_CHECK_INTERVAL_MS || '60000', 10);
+const SERVER_STARTED_AT = Date.now();
+const VALID_MESSAGE_STATUSES = ['pending', 'delivered', 'processing', 'completed', 'failed', 'timeout'];
+const VALID_HEALTH_STATUSES = ['healthy', 'degraded', 'unhealthy', 'offline'];
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: BODY_LIMIT }));
+
+function parseJson(value, fallback) {
+  try {
+    return value ? JSON.parse(value) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function toPositiveInt(value, fallback, max = 500) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.min(parsed, max);
+}
+
+function getPagination(query, defaultLimit = 50, maxLimit = 200) {
+  return {
+    limit: toPositiveInt(query.limit, defaultLimit, maxLimit),
+    offset: toPositiveInt(query.offset, 0, Number.MAX_SAFE_INTEGER)
+  };
+}
+
+function applyPaginationHeaders(res, total, limit, offset) {
+  res.set('X-Total-Count', String(total));
+  res.set('X-Limit', String(limit));
+  res.set('X-Offset', String(offset));
+}
+
+function normalizeMessage(row) {
+  return {
+    id: row.id,
+    from: row.from_agent,
+    to: row.to_agent,
+    content: row.content,
+    messageType: row.message_type,
+    read: Boolean(row.read),
+    status: row.status,
+    timeoutMs: row.timeout_ms,
+    createdAt: row.created_at
+  };
+}
+
+async function resolveAgent(identifier) {
+  if (!identifier) return null;
+  return db.get('SELECT * FROM agents WHERE id = ? OR name = ? LIMIT 1', [identifier, identifier]);
+}
+
+async function requireAgent(identifier, fieldName = 'agent') {
+  const agent = await resolveAgent(identifier);
+  if (!agent) {
+    const error = new Error(`${fieldName} not found`);
+    error.statusCode = 404;
+    throw error;
+  }
+  return agent;
+}
+
+async function fetchMessages(filters = {}, pagination = { limit: 50, offset: 0 }) {
+  const clauses = [];
+  const params = [];
+
+  if (filters.toAgent) {
+    clauses.push('to_agent = ?');
+    params.push(filters.toAgent);
+  }
+
+  if (filters.fromAgent) {
+    clauses.push('from_agent = ?');
+    params.push(filters.fromAgent);
+  }
+
+  if (filters.since) {
+    clauses.push('created_at > ?');
+    params.push(filters.since);
+  }
+
+  if (filters.unreadOnly) {
+    clauses.push('read = 0');
+  }
+
+  if (filters.status) {
+    clauses.push('status = ?');
+    params.push(filters.status);
+  }
+
+  if (filters.messageType) {
+    clauses.push('message_type = ?');
+    params.push(filters.messageType);
+  }
+
+  const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+  const totalRow = await db.get(`SELECT COUNT(*) as count FROM messages ${where}`, params);
+  const rows = await db.all(
+    `SELECT * FROM messages ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+    [...params, pagination.limit, pagination.offset]
+  );
+
+  return {
+    total: totalRow?.count || 0,
+    items: rows.map(normalizeMessage)
+  };
+}
 
 // Optional: Serve the Web UI build (webui/dist)
 // This is convenience for LAN/Tailscale usage.
-try {
-  const webuiDist = join(__dirname, 'webui', 'dist');
+const webuiDist = join(__dirname, 'webui', 'dist');
+if (existsSync(webuiDist)) {
   app.use('/', express.static(webuiDist));
-} catch (e) {
-  // ignore
 }
 
 // Initialize SQLite
 let db;
 async function initDb() {
-  const dbPath = join(__dirname, 'agent-mesh.db');
-
   db = await open({
-    filename: dbPath,
+    filename: DB_PATH,
     driver: sqlite3.Database
   });
 
@@ -52,7 +160,7 @@ async function initDb() {
   await db.exec('PRAGMA temp_store = MEMORY;');
   await db.exec('PRAGMA locking_mode = NORMAL;');
 
-  console.log(`[DB] SQLite initialized: ${dbPath}`);
+  console.log(`[DB] SQLite initialized: ${DB_PATH}`);
   console.log('[DB] Windows-safe mode: DELETE journal, FULL sync, MEMORY temp_store');
 
   await db.exec(`
@@ -230,7 +338,6 @@ function requireApiKey(req, res, next) {
   if (!key || key.trim() !== API_KEY) {
     return res.status(401).json({
       error: 'Invalid or missing API key',
-      expected: API_KEY,
       received: key ? `${key.substring(0, 3)}...` : 'none'
     });
   }
@@ -303,10 +410,47 @@ app.post('/api/agents/register', requireApiKey, async (req, res) => {
 // List agents
 app.get('/api/agents', requireApiKey, async (req, res) => {
   try {
-    const agents = await db.all('SELECT * FROM agents ORDER BY last_seen DESC');
+    const { capability, search, status } = req.query;
+    const { limit, offset } = getPagination(req.query);
+    const clauses = [];
+    const params = [];
+
+    if (capability) {
+      clauses.push('a.capabilities LIKE ?');
+      params.push(`%${capability}%`);
+    }
+
+    if (search) {
+      clauses.push('(a.name LIKE ? OR a.endpoint LIKE ?)');
+      params.push(`%${search}%`, `%${search}%`);
+    }
+
+    if (status) {
+      clauses.push('COALESCE(h.status, ?) = ?');
+      params.push('unknown', status);
+    }
+
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+    const totalRow = await db.get(
+      `SELECT COUNT(*) as count FROM agents a LEFT JOIN agent_health_status h ON a.id = h.agent_id ${where}`,
+      params
+    );
+    const agents = await db.all(
+      `SELECT a.*, h.status as health_status, h.last_updated as health_last_updated
+       FROM agents a
+       LEFT JOIN agent_health_status h ON a.id = h.agent_id
+       ${where}
+       ORDER BY a.last_seen DESC
+       LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+
+    applyPaginationHeaders(res, totalRow?.count || 0, limit, offset);
     res.json(agents.map(a => ({
       ...a,
-      capabilities: JSON.parse(a.capabilities || '[]')
+      status: a.health_status || 'unknown',
+      healthLastUpdated: a.health_last_updated || null,
+      capabilities: parseJson(a.capabilities, [])
     })));
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -316,28 +460,137 @@ app.get('/api/agents', requireApiKey, async (req, res) => {
 // Get single agent
 app.get('/api/agents/:id', requireApiKey, async (req, res) => {
   try {
-    const agent = await db.get('SELECT * FROM agents WHERE id = ?', req.params.id);
+    const agent = await db.get(`
+      SELECT a.*, h.status as health_status, h.last_updated as health_last_updated
+      FROM agents a
+      LEFT JOIN agent_health_status h ON a.id = h.agent_id
+      WHERE a.id = ?
+    `, req.params.id);
+
     if (!agent) {
       return res.status(404).json({ error: 'Agent not found' });
     }
+
     res.json({
       ...agent,
-      capabilities: JSON.parse(agent.capabilities || '[]')
+      status: agent.health_status || 'unknown',
+      healthLastUpdated: agent.health_last_updated || null,
+      capabilities: parseJson(agent.capabilities, [])
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Heartbeat - update last_seen
+// Update agent details
+app.put('/api/agents/:id', requireApiKey, async (req, res) => {
+  try {
+    const existing = await db.get('SELECT * FROM agents WHERE id = ?', req.params.id);
+    if (!existing) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+
+    const name = req.body.name || existing.name;
+    const endpoint = req.body.endpoint !== undefined ? req.body.endpoint : existing.endpoint;
+    const capabilities = Array.isArray(req.body.capabilities)
+      ? JSON.stringify(req.body.capabilities)
+      : existing.capabilities;
+
+    await db.run(
+      'UPDATE agents SET name = ?, endpoint = ?, capabilities = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?',
+      [name, endpoint, capabilities, req.params.id]
+    );
+
+    const updated = await db.get('SELECT * FROM agents WHERE id = ?', req.params.id);
+    const payload = {
+      ...updated,
+      capabilities: parseJson(updated.capabilities, [])
+    };
+
+    broadcast({
+      type: 'agent_updated',
+      agent: payload
+    });
+
+    res.json({ success: true, agent: payload });
+  } catch (error) {
+    console.error('[Error] Update agent:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete agent
+app.delete('/api/agents/:id', requireApiKey, async (req, res) => {
+  try {
+    const agent = await db.get('SELECT * FROM agents WHERE id = ?', req.params.id);
+    if (!agent) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+
+    await db.run('DELETE FROM agents WHERE id = ?', req.params.id);
+
+    broadcast({
+      type: 'agent_left',
+      agentId: req.params.id,
+      name: agent.name
+    });
+
+    res.json({ success: true, agentId: req.params.id, deleted: true });
+  } catch (error) {
+    console.error('[Error] Delete agent:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Heartbeat - update last_seen and optional health metrics
 app.post('/api/agents/:id/heartbeat', requireApiKey, async (req, res) => {
   try {
+    const { status = 'healthy', uptimeSeconds, cpuUsage, memoryUsage, customMetrics = {} } = req.body || {};
+
+    if (!VALID_HEALTH_STATUSES.includes(status)) {
+      return res.status(400).json({ error: `Invalid health status. Must be one of: ${VALID_HEALTH_STATUSES.join(', ')}` });
+    }
+
+    const existing = await db.get('SELECT id FROM agents WHERE id = ?', req.params.id);
+    if (!existing) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+
     await db.run(
       'UPDATE agents SET last_seen = CURRENT_TIMESTAMP WHERE id = ?',
       req.params.id
     );
-    res.json({ success: true });
+
+    await db.run(`
+      INSERT INTO agent_health_status
+       (agent_id, status, last_heartbeat, uptime_seconds, cpu_usage, memory_usage, custom_metrics, last_updated)
+      VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(agent_id) DO UPDATE SET
+        status = excluded.status,
+        last_heartbeat = CURRENT_TIMESTAMP,
+        uptime_seconds = excluded.uptime_seconds,
+        cpu_usage = excluded.cpu_usage,
+        memory_usage = excluded.memory_usage,
+        custom_metrics = excluded.custom_metrics,
+        last_updated = CURRENT_TIMESTAMP
+    `,
+    [req.params.id, status, uptimeSeconds || null, cpuUsage || null, memoryUsage || null, JSON.stringify(customMetrics)]);
+
+    broadcast({
+      type: 'agent_health_change',
+      agentId: req.params.id,
+      status,
+      metrics: { uptimeSeconds, cpuUsage, memoryUsage, customMetrics }
+    });
+
+    res.json({
+      success: true,
+      agentId: req.params.id,
+      status,
+      metrics: { uptimeSeconds, cpuUsage, memoryUsage, customMetrics }
+    });
   } catch (error) {
+    console.error('[Error] Agent heartbeat:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -347,29 +600,80 @@ app.post('/api/agents/:id/heartbeat', requireApiKey, async (req, res) => {
 // Send message
 app.post('/api/messages', requireApiKey, async (req, res) => {
   try {
-    const { from, to, content, messageType = 'direct' } = req.body;
-    
+    const from = req.body.from || req.body.fromAgentId || req.body.fromAgent || req.body.sender;
+    const to = req.body.to || req.body.toAgentId || req.body.toAgent || req.body.recipient;
+    const content = req.body.content || req.body.message;
+    const { messageType = 'direct' } = req.body;
+    const timeoutMs = toPositiveInt(req.body.timeoutMs, DEFAULT_MESSAGE_TIMEOUT_MS, Number.MAX_SAFE_INTEGER);
+
     if (!from || !to || !content) {
       return res.status(400).json({ error: 'from, to, and content are required' });
     }
-    
+
+    const fromAgent = await requireAgent(from, 'from agent');
+    const toAgent = await requireAgent(to, 'to agent');
+
     const id = uuidv4();
     await db.run(
-      'INSERT INTO messages (id, from_agent, to_agent, content, message_type) VALUES (?, ?, ?, ?, ?)',
-      [id, from, to, content, messageType]
+      'INSERT INTO messages (id, from_agent, to_agent, content, message_type, timeout_ms) VALUES (?, ?, ?, ?, ?, ?)',
+      [id, fromAgent.id, toAgent.id, content, messageType, timeoutMs]
     );
-    
-    const message = { id, from, to, content, messageType, createdAt: new Date().toISOString() };
-    
+
+    const message = {
+      id,
+      from: fromAgent.id,
+      fromName: fromAgent.name,
+      to: toAgent.id,
+      toName: toAgent.name,
+      content,
+      messageType,
+      timeoutMs,
+      createdAt: new Date().toISOString()
+    };
+
     // WebSocket broadcast
     broadcast({
       type: 'new_message',
       message
     });
-    
+
     res.json({ success: true, messageId: id, message });
   } catch (error) {
     console.error('[Error] Send message:', error);
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+// List all messages
+app.get('/api/messages', requireApiKey, async (req, res) => {
+  try {
+    const pagination = getPagination(req.query, 100, 500);
+    const { items, total } = await fetchMessages({
+      toAgent: req.query.toAgent,
+      fromAgent: req.query.fromAgent,
+      since: req.query.since,
+      unreadOnly: req.query.unreadOnly === 'true',
+      status: req.query.status,
+      messageType: req.query.messageType
+    }, pagination);
+
+    applyPaginationHeaders(res, total, pagination.limit, pagination.offset);
+    res.json(items);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get message details
+app.get('/api/messages/by-id/:id', requireApiKey, async (req, res) => {
+  try {
+    const message = await db.get('SELECT * FROM messages WHERE id = ?', req.params.id);
+    if (!message) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
+
+    res.json(normalizeMessage(message));
+  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
@@ -377,34 +681,84 @@ app.post('/api/messages', requireApiKey, async (req, res) => {
 // Get messages for agent
 app.get('/api/messages/:agentId', requireApiKey, async (req, res) => {
   try {
-    const { since, unreadOnly } = req.query;
-    
-    let query = 'SELECT * FROM messages WHERE to_agent = ?';
-    const params = [req.params.agentId];
-    
-    if (since) {
-      query += ' AND created_at > ?';
-      params.push(since);
-    }
-    
-    if (unreadOnly === 'true') {
-      query += ' AND read = 0';
-    }
-    
-    query += ' ORDER BY created_at DESC';
-    
-    const messages = await db.all(query, params);
-    res.json(messages);
+    const agent = await requireAgent(req.params.agentId, 'agent');
+    const pagination = getPagination(req.query, 100, 500);
+    const { items, total } = await fetchMessages({
+      toAgent: agent.id,
+      since: req.query.since,
+      unreadOnly: req.query.unreadOnly === 'true',
+      status: req.query.status,
+      messageType: req.query.messageType
+    }, pagination);
+
+    applyPaginationHeaders(res, total, pagination.limit, pagination.offset);
+    res.json(items);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+// Backward-compatible alias routes
+app.get('/api/agents/:agentId/messages', requireApiKey, async (req, res) => {
+  try {
+    const agent = await requireAgent(req.params.agentId, 'agent');
+    const pagination = getPagination(req.query, 100, 500);
+    const { items, total } = await fetchMessages({
+      toAgent: agent.id,
+      since: req.query.since,
+      unreadOnly: req.query.unreadOnly === 'true',
+      status: req.query.status,
+      messageType: req.query.messageType
+    }, pagination);
+
+    applyPaginationHeaders(res, total, pagination.limit, pagination.offset);
+    res.json(items);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+app.get('/api/agents/:agentId/inbox', requireApiKey, async (req, res) => {
+  try {
+    const agent = await requireAgent(req.params.agentId, 'agent');
+    const pagination = getPagination(req.query, 100, 500);
+    const { items, total } = await fetchMessages({
+      toAgent: agent.id,
+      since: req.query.since,
+      unreadOnly: true,
+      status: req.query.status,
+      messageType: req.query.messageType
+    }, pagination);
+
+    applyPaginationHeaders(res, total, pagination.limit, pagination.offset);
+    res.json(items);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
 // Mark message as read
 app.post('/api/messages/:id/read', requireApiKey, async (req, res) => {
   try {
-    await db.run('UPDATE messages SET read = 1 WHERE id = ?', req.params.id);
+    const result = await db.run('UPDATE messages SET read = 1 WHERE id = ?', req.params.id);
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
     res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete message
+app.delete('/api/messages/:id', requireApiKey, async (req, res) => {
+  try {
+    const result = await db.run('DELETE FROM messages WHERE id = ?', req.params.id);
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
+
+    res.json({ success: true, messageId: req.params.id, deleted: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -413,21 +767,25 @@ app.post('/api/messages/:id/read', requireApiKey, async (req, res) => {
 // Broadcast to all agents
 app.post('/api/broadcast', requireApiKey, async (req, res) => {
   try {
-    const { from, content } = req.body;
-    
+    const from = req.body.from || req.body.fromAgentId || req.body.sender;
+    const { content } = req.body;
+    const timeoutMs = toPositiveInt(req.body.timeoutMs, DEFAULT_MESSAGE_TIMEOUT_MS, Number.MAX_SAFE_INTEGER);
+
     if (!from || !content) {
       return res.status(400).json({ error: 'from and content are required' });
     }
-    
+
+    const fromAgent = await requireAgent(from, 'from agent');
+
     // Get all agents
-    const agents = await db.all('SELECT id FROM agents WHERE id != ?', from);
-    
+    const agents = await db.all('SELECT id FROM agents WHERE id != ?', fromAgent.id);
+
     const messageIds = [];
     for (const agent of agents) {
       const id = uuidv4();
       await db.run(
-        'INSERT INTO messages (id, from_agent, to_agent, content, message_type) VALUES (?, ?, ?, ?, ?)',
-        [id, from, agent.id, content, 'broadcast']
+        'INSERT INTO messages (id, from_agent, to_agent, content, message_type, timeout_ms) VALUES (?, ?, ?, ?, ?, ?)',
+        [id, fromAgent.id, agent.id, content, 'broadcast', timeoutMs]
       );
       messageIds.push(id);
     }
@@ -435,7 +793,8 @@ app.post('/api/broadcast', requireApiKey, async (req, res) => {
     // WebSocket broadcast
     broadcast({
       type: 'broadcast',
-      from,
+      from: fromAgent.id,
+      fromName: fromAgent.name,
       content,
       recipientCount: agents.length
     });
@@ -447,7 +806,7 @@ app.post('/api/broadcast', requireApiKey, async (req, res) => {
     });
   } catch (error) {
     console.error('[Error] Broadcast:', error);
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -531,21 +890,24 @@ app.post('/api/skills/:id/invoke', requireApiKey, async (req, res) => {
 // Create a new agent group
 app.post('/api/groups', requireApiKey, async (req, res) => {
   try {
-    const { name, description, createdBy, metadata } = req.body;
+    const { name, description, metadata } = req.body;
+    const createdByInput = req.body.createdBy || req.body.createdByAgent || req.body.owner;
 
-    if (!name || !createdBy) {
+    if (!name || !createdByInput) {
       return res.status(400).json({ error: 'name and createdBy are required' });
     }
+
+    const createdBy = await requireAgent(createdByInput, 'createdBy agent');
 
     const id = uuidv4();
     await db.run(
       'INSERT INTO agent_groups (id, name, description, metadata, created_by) VALUES (?, ?, ?, ?, ?)',
-      [id, name, description || null, JSON.stringify(metadata || {}), createdBy]
+      [id, name, description || null, JSON.stringify(metadata || {}), createdBy.id]
     );
 
     broadcast({
       type: 'group_created',
-      group: { id, name, description, createdBy, metadata }
+      group: { id, name, description, createdBy: createdBy.id, createdByName: createdBy.name, metadata }
     });
 
     res.json({
@@ -555,23 +917,27 @@ app.post('/api/groups', requireApiKey, async (req, res) => {
     });
   } catch (error) {
     console.error('[Error] Create group:', error);
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
 // List all agent groups
 app.get('/api/groups', requireApiKey, async (req, res) => {
   try {
+    const { limit, offset } = getPagination(req.query, 50, 200);
+    const totalRow = await db.get('SELECT COUNT(*) as count FROM agent_groups');
     const groups = await db.all(`
       SELECT g.*,
         (SELECT COUNT(*) FROM agent_group_members WHERE group_id = g.id) as member_count
       FROM agent_groups g
       ORDER BY g.created_at DESC
-    `);
+      LIMIT ? OFFSET ?
+    `, [limit, offset]);
 
+    applyPaginationHeaders(res, totalRow?.count || 0, limit, offset);
     res.json(groups.map(g => ({
       ...g,
-      metadata: JSON.parse(g.metadata || '{}')
+      metadata: parseJson(g.metadata, {})
     })));
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -597,10 +963,10 @@ app.get('/api/groups/:id', requireApiKey, async (req, res) => {
 
     res.json({
       ...group,
-      metadata: JSON.parse(group.metadata || '{}'),
+      metadata: parseJson(group.metadata, {}),
       members: members.map(m => ({
         ...m,
-        capabilities: JSON.parse(m.capabilities || '[]')
+        capabilities: parseJson(m.capabilities, [])
       }))
     });
   } catch (error) {
@@ -624,15 +990,12 @@ app.post('/api/groups/:groupId/members', requireApiKey, async (req, res) => {
     }
 
     // Verify agent exists
-    const agent = await db.get('SELECT id FROM agents WHERE id = ?', agentId);
-    if (!agent) {
-      return res.status(404).json({ error: 'Agent not found' });
-    }
+    const agent = await requireAgent(agentId, 'agent');
 
     // Check if already a member
     const existing = await db.get(
       'SELECT * FROM agent_group_members WHERE group_id = ? AND agent_id = ?',
-      [req.params.groupId, agentId]
+      [req.params.groupId, agent.id]
     );
 
     if (existing) {
@@ -641,13 +1004,14 @@ app.post('/api/groups/:groupId/members', requireApiKey, async (req, res) => {
 
     await db.run(
       'INSERT INTO agent_group_members (group_id, agent_id, role) VALUES (?, ?, ?)',
-      [req.params.groupId, agentId, role]
+      [req.params.groupId, agent.id, role]
     );
 
     broadcast({
       type: 'group_member_added',
       groupId: req.params.groupId,
-      agentId,
+      agentId: agent.id,
+      agentName: agent.name,
       role
     });
 
@@ -657,7 +1021,7 @@ app.post('/api/groups/:groupId/members', requireApiKey, async (req, res) => {
     });
   } catch (error) {
     console.error('[Error] Add group member:', error);
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -691,20 +1055,21 @@ app.delete('/api/groups/:groupId/members/:agentId', requireApiKey, async (req, r
 // Discover groups by agent
 app.get('/api/agents/:agentId/groups', requireApiKey, async (req, res) => {
   try {
+    const agent = await requireAgent(req.params.agentId, 'agent');
     const groups = await db.all(`
       SELECT g.*, agm.role
       FROM agent_groups g
       JOIN agent_group_members agm ON g.id = agm.group_id
       WHERE agm.agent_id = ?
       ORDER BY g.created_at DESC
-    `, req.params.agentId);
+    `, agent.id);
 
     res.json(groups.map(g => ({
       ...g,
-      metadata: JSON.parse(g.metadata || '{}')
+      metadata: parseJson(g.metadata, {})
     })));
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -721,7 +1086,7 @@ app.get('/api/groups/:groupId/agents', requireApiKey, async (req, res) => {
 
     res.json(agents.map(a => ({
       ...a,
-      capabilities: JSON.parse(a.capabilities || '[]')
+      capabilities: parseJson(a.capabilities, [])
     })));
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -731,18 +1096,21 @@ app.get('/api/groups/:groupId/agents', requireApiKey, async (req, res) => {
 // Send message to entire group
 app.post('/api/groups/:groupId/broadcast', requireApiKey, async (req, res) => {
   try {
-    const { from, content, messageType = 'direct' } = req.body;
+    const from = req.body.from || req.body.fromAgentId || req.body.sender;
+    const { content, messageType = 'direct' } = req.body;
 
     if (!from || !content) {
       return res.status(400).json({ error: 'from and content are required' });
     }
+
+    const fromAgent = await requireAgent(from, 'from agent');
 
     // Get all agents in group except sender
     const agents = await db.all(`
       SELECT agm.agent_id
       FROM agent_group_members agm
       WHERE agm.group_id = ? AND agm.agent_id != ?
-    `, [req.params.groupId, from]);
+    `, [req.params.groupId, fromAgent.id]);
 
     if (agents.length === 0) {
       return res.status(404).json({ error: 'No agents found in group' });
@@ -752,8 +1120,8 @@ app.post('/api/groups/:groupId/broadcast', requireApiKey, async (req, res) => {
     for (const agent of agents) {
       const id = uuidv4();
       await db.run(
-        'INSERT INTO messages (id, from_agent, to_agent, content, message_type, status) VALUES (?, ?, ?, ?, ?, ?)',
-        [id, from, agent.agent_id, content, messageType, 'delivered']
+        'INSERT INTO messages (id, from_agent, to_agent, content, message_type, status, timeout_ms) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [id, fromAgent.id, agent.agent_id, content, messageType, 'delivered', DEFAULT_MESSAGE_TIMEOUT_MS]
       );
       messageIds.push(id);
     }
@@ -761,7 +1129,8 @@ app.post('/api/groups/:groupId/broadcast', requireApiKey, async (req, res) => {
     broadcast({
       type: 'group_broadcast',
       groupId: req.params.groupId,
-      from,
+      from: fromAgent.id,
+      fromName: fromAgent.name,
       content,
       recipientCount: agents.length
     });
@@ -773,7 +1142,7 @@ app.post('/api/groups/:groupId/broadcast', requireApiKey, async (req, res) => {
     });
   } catch (error) {
     console.error('[Error] Group broadcast:', error);
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -782,16 +1151,19 @@ app.post('/api/groups/:groupId/broadcast', requireApiKey, async (req, res) => {
 // Store shared memory in a group
 app.post('/api/groups/:groupId/memory', requireApiKey, async (req, res) => {
   try {
-    const { agentId, key, value, memoryType = 'shared' } = req.body;
+    const agentInput = req.body.agentId || req.body.agentName || req.body.agent;
+    const { key, value, memoryType = 'shared' } = req.body;
 
-    if (!agentId || !key || value === undefined) {
+    if (!agentInput || !key || value === undefined) {
       return res.status(400).json({ error: 'agentId, key, and value are required' });
     }
+
+    const agent = await requireAgent(agentInput, 'agent');
 
     // Verify group exists and agent is a member
     const membership = await db.get(
       'SELECT * FROM agent_group_members WHERE group_id = ? AND agent_id = ?',
-      [req.params.groupId, agentId]
+      [req.params.groupId, agent.id]
     );
 
     if (!membership) {
@@ -810,14 +1182,14 @@ app.post('/api/groups/:groupId/memory', requireApiKey, async (req, res) => {
       memoryId = existing.id;
       await db.run(
         'UPDATE collective_memory SET value = ?, agent_id = ?, memory_type = ?, version = version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-        [JSON.stringify(value), agentId, memoryType, memoryId]
+        [JSON.stringify(value), agent.id, memoryType, memoryId]
       );
     } else {
       // Create new memory entry
       memoryId = uuidv4();
       await db.run(
         'INSERT INTO collective_memory (id, group_id, agent_id, key, value, memory_type) VALUES (?, ?, ?, ?, ?, ?)',
-        [memoryId, req.params.groupId, agentId, key, JSON.stringify(value), memoryType]
+        [memoryId, req.params.groupId, agent.id, key, JSON.stringify(value), memoryType]
       );
     }
 
@@ -826,7 +1198,7 @@ app.post('/api/groups/:groupId/memory', requireApiKey, async (req, res) => {
       groupId: req.params.groupId,
       memoryId,
       key,
-      agentId
+      agentId: agent.id
     });
 
     res.json({
@@ -836,7 +1208,7 @@ app.post('/api/groups/:groupId/memory', requireApiKey, async (req, res) => {
     });
   } catch (error) {
     console.error('[Error] Store memory:', error);
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -895,16 +1267,18 @@ app.get('/api/groups/:groupId/memory/:key', requireApiKey, async (req, res) => {
 // Delete memory key
 app.delete('/api/groups/:groupId/memory/:key', requireApiKey, async (req, res) => {
   try {
-    const { agentId } = req.body;
+    const agentInput = req.body.agentId || req.body.agentName || req.body.agent;
 
-    if (!agentId) {
+    if (!agentInput) {
       return res.status(400).json({ error: 'agentId is required' });
     }
+
+    const agent = await requireAgent(agentInput, 'agent');
 
     // Verify membership
     const membership = await db.get(
       'SELECT * FROM agent_group_members WHERE group_id = ? AND agent_id = ?',
-      [req.params.groupId, agentId]
+      [req.params.groupId, agent.id]
     );
 
     if (!membership) {
@@ -924,7 +1298,7 @@ app.delete('/api/groups/:groupId/memory/:key', requireApiKey, async (req, res) =
       type: 'memory_deleted',
       groupId: req.params.groupId,
       key: req.params.key,
-      agentId
+      agentId: agent.id
     });
 
     res.json({
@@ -932,7 +1306,7 @@ app.delete('/api/groups/:groupId/memory/:key', requireApiKey, async (req, res) =
       message: 'Memory deleted successfully'
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -972,9 +1346,8 @@ app.patch('/api/messages/:id/status', requireApiKey, async (req, res) => {
       return res.status(400).json({ error: 'status is required' });
     }
 
-    const validStatuses = ['pending', 'delivered', 'processing', 'completed', 'failed', 'timeout'];
-    if (!validStatuses.includes(status)) {
-      return res.status(400).json({ error: `Invalid status. Must be one of: ${validStatuses.join(', ')}` });
+    if (!VALID_MESSAGE_STATUSES.includes(status)) {
+      return res.status(400).json({ error: `Invalid status. Must be one of: ${VALID_MESSAGE_STATUSES.join(', ')}` });
     }
 
     const message = await db.get('SELECT * FROM messages WHERE id = ?', req.params.id);
@@ -1009,16 +1382,17 @@ app.patch('/api/messages/:id/status', requireApiKey, async (req, res) => {
 // Get failed/timeout messages for retry
 app.get('/api/messages/:agentId/failed', requireApiKey, async (req, res) => {
   try {
+    const agent = await requireAgent(req.params.agentId, 'agent');
     const messages = await db.all(`
       SELECT * FROM messages
       WHERE to_agent = ? AND status IN ('failed', 'timeout')
       ORDER BY created_at DESC
       LIMIT 50
-    `, req.params.agentId);
+    `, agent.id);
 
-    res.json(messages);
+    res.json(messages.map(normalizeMessage));
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -1062,24 +1436,22 @@ app.post('/api/messages/:id/retry', requireApiKey, async (req, res) => {
 // Upload file to mesh
 app.post('/api/files/upload', requireApiKey, async (req, res) => {
   try {
-    const { agentId, filename, fileType, fileData, description } = req.body;
+    const agentInput = req.body.agentId || req.body.agentName || req.body.agent;
+    const { filename, fileType, fileData, description } = req.body;
 
-    if (!agentId || !filename || !fileData) {
+    if (!agentInput || !filename || !fileData) {
       return res.status(400).json({ error: 'agentId, filename, and fileData are required' });
     }
 
     // Verify agent exists
-    const agent = await db.get('SELECT * FROM agents WHERE id = ?', agentId);
-    if (!agent) {
-      return res.status(404).json({ error: 'Agent not found' });
-    }
+    const agent = await requireAgent(agentInput, 'agent');
 
     const id = uuidv4();
     const fileSize = Buffer.from(fileData, 'base64').length;
 
     await db.run(
       'INSERT INTO agent_files (id, agent_id, filename, file_type, file_size, file_data, description) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [id, agentId, filename, fileType || null, fileSize, fileData, description || null]
+      [id, agent.id, filename, fileType || null, fileSize, fileData, description || null]
     );
 
     console.log(`[File Upload] Agent "${agent.name}" uploaded file: ${filename} (${fileSize} bytes)`);
@@ -1087,7 +1459,7 @@ app.post('/api/files/upload', requireApiKey, async (req, res) => {
     // Broadcast file availability
     broadcast({
       type: 'file_available',
-      file: { id, agentId, filename, fileType, fileSize, description }
+      file: { id, agentId: agent.id, agentName: agent.name, filename, fileType, fileSize, description }
     });
 
     res.json({
@@ -1100,7 +1472,7 @@ app.post('/api/files/upload', requireApiKey, async (req, res) => {
     });
   } catch (error) {
     console.error('[Error] Upload file:', error);
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -1125,17 +1497,19 @@ app.get('/api/files/:id', requireApiKey, async (req, res) => {
 // List all files
 app.get('/api/files', requireApiKey, async (req, res) => {
   try {
-    const { agentId } = req.query;
+    const agentFilter = req.query.agentId || req.query.agentName || req.query.agent;
+    const { limit, offset } = getPagination(req.query, 50, 200);
 
-    let query = 'SELECT * FROM agent_files ORDER BY created_at DESC';
-    let params = [];
+    const agent = agentFilter ? await requireAgent(agentFilter, 'agent') : null;
+    const where = agent ? 'WHERE agent_id = ?' : '';
+    const params = agent ? [agent.id] : [];
+    const totalRow = await db.get(`SELECT COUNT(*) as count FROM agent_files ${where}`, params);
+    const files = await db.all(
+      `SELECT * FROM agent_files ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
 
-    if (agentId) {
-      query = 'SELECT * FROM agent_files WHERE agent_id = ? ORDER BY created_at DESC';
-      params = [agentId];
-    }
-
-    const files = await db.all(query, params);
+    applyPaginationHeaders(res, totalRow?.count || 0, limit, offset);
     res.json(files.map(f => ({
       id: f.id,
       agentId: f.agent_id,
@@ -1153,12 +1527,13 @@ app.get('/api/files', requireApiKey, async (req, res) => {
 // Delete file
 app.delete('/api/files/:id', requireApiKey, async (req, res) => {
   try {
-    const { agentId } = req.body;
+    const agentInput = req.body.agentId || req.body.agentName || req.body.agent;
 
-    if (!agentId) {
+    if (!agentInput) {
       return res.status(400).json({ error: 'agentId is required for deletion' });
     }
 
+    const agent = await requireAgent(agentInput, 'agent');
     const file = await db.get('SELECT * FROM agent_files WHERE id = ?', req.params.id);
 
     if (!file) {
@@ -1166,7 +1541,7 @@ app.delete('/api/files/:id', requireApiKey, async (req, res) => {
     }
 
     // Verify ownership
-    if (file.agent_id !== agentId) {
+    if (file.agent_id !== agent.id) {
       return res.status(403).json({ error: 'You can only delete your own files' });
     }
 
@@ -1179,7 +1554,7 @@ app.delete('/api/files/:id', requireApiKey, async (req, res) => {
       message: 'File deleted successfully'
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -1234,20 +1609,27 @@ app.post('/api/updates', requireApiKey, async (req, res) => {
 app.get('/api/updates', requireApiKey, async (req, res) => {
   try {
     const { since, activeOnly } = req.query;
-
-    let query = 'SELECT * FROM system_updates ORDER BY created_at DESC';
-    let params = [];
+    const { limit, offset } = getPagination(req.query, 50, 200);
+    const clauses = [];
+    const params = [];
 
     if (since) {
-      query = 'SELECT * FROM system_updates WHERE created_at > ? ORDER BY created_at DESC';
-      params = [since];
+      clauses.push('created_at > ?');
+      params.push(since);
     }
 
     if (activeOnly === 'true') {
-      query = 'SELECT * FROM system_updates WHERE expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP ORDER BY created_at DESC';
+      clauses.push('(expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)');
     }
 
-    const updates = await db.all(query, params);
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+    const totalRow = await db.get(`SELECT COUNT(*) as count FROM system_updates ${where}`, params);
+    const updates = await db.all(
+      `SELECT * FROM system_updates ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+
+    applyPaginationHeaders(res, totalRow?.count || 0, limit, offset);
     res.json(updates);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1257,11 +1639,14 @@ app.get('/api/updates', requireApiKey, async (req, res) => {
 // Acknowledge update
 app.post('/api/updates/:id/acknowledge', requireApiKey, async (req, res) => {
   try {
-    const { agentId, status, agentVersion, notes } = req.body;
+    const agentInput = req.body.agentId || req.body.agentName || req.body.agent;
+    const { status, agentVersion, notes } = req.body;
 
-    if (!agentId || !status) {
+    if (!agentInput || !status) {
       return res.status(400).json({ error: 'agentId and status are required' });
     }
+
+    const agent = await requireAgent(agentInput, 'agent');
 
     // Check if update exists
     const update = await db.get('SELECT * FROM system_updates WHERE id = ?', req.params.id);
@@ -1269,13 +1654,25 @@ app.post('/api/updates/:id/acknowledge', requireApiKey, async (req, res) => {
       return res.status(404).json({ error: 'Update not found' });
     }
 
-    const id = uuidv4();
-    await db.run(
-      'INSERT INTO update_acknowledgments (id, update_id, agent_id, agent_version, status, notes) VALUES (?, ?, ?, ?, ?, ?)',
-      [id, req.params.id, agentId, agentVersion || null, status, notes || null]
+    const existing = await db.get(
+      'SELECT id FROM update_acknowledgments WHERE update_id = ? AND agent_id = ?',
+      [req.params.id, agent.id]
+    );
+    const id = existing?.id || uuidv4();
+
+    await db.run(`
+      INSERT INTO update_acknowledgments (id, update_id, agent_id, agent_version, status, notes)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(update_id, agent_id) DO UPDATE SET
+        agent_version = excluded.agent_version,
+        status = excluded.status,
+        notes = excluded.notes,
+        acknowledged_at = CURRENT_TIMESTAMP
+    `,
+      [id, req.params.id, agent.id, agentVersion || null, status, notes || null]
     );
 
-    console.log(`[Update Acknowledgment] Agent ${agentId} acknowledged update ${req.params.id}: ${status}`);
+    console.log(`[Update Acknowledgment] Agent ${agent.id} acknowledged update ${req.params.id}: ${status}`);
 
     res.json({
       success: true,
@@ -1283,7 +1680,7 @@ app.post('/api/updates/:id/acknowledge', requireApiKey, async (req, res) => {
       acknowledgmentId: id
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -1432,24 +1829,31 @@ app.get('/api/catastrophe/:id', requireApiKey, async (req, res) => {
 app.get('/api/catastrophe', requireApiKey, async (req, res) => {
   try {
     const { status: statusFilter, severity: severityFilter } = req.query;
-
-    let query = 'SELECT * FROM catastrophe_events ORDER BY occurred_at DESC';
-    let params = [];
+    const { limit, offset } = getPagination(req.query, 50, 200);
+    const clauses = [];
+    const params = [];
 
     if (statusFilter) {
-      query = 'SELECT * FROM catastrophe_events WHERE status = ? ORDER BY occurred_at DESC';
-      params = [statusFilter];
+      clauses.push('status = ?');
+      params.push(statusFilter);
     }
 
     if (severityFilter) {
-      query = 'SELECT * FROM catastrophe_events WHERE severity = ? ORDER BY occurred_at DESC';
-      params = [severityFilter];
+      clauses.push('severity = ?');
+      params.push(severityFilter);
     }
 
-    const catastrophes = await db.all(query, params);
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+    const totalRow = await db.get(`SELECT COUNT(*) as count FROM catastrophe_events ${where}`, params);
+    const catastrophes = await db.all(
+      `SELECT * FROM catastrophe_events ${where} ORDER BY occurred_at DESC LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+
+    applyPaginationHeaders(res, totalRow?.count || 0, limit, offset);
     res.json(catastrophes.map(c => ({
       ...c,
-      affectedAgents: JSON.parse(c.affected_agents || '[]')
+      affectedAgents: parseJson(c.affected_agents, [])
     })));
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1479,27 +1883,45 @@ app.post('/api/catastrophe/:id/resolve', requireApiKey, async (req, res) => {
 
 // === ENHANCED HEALTH MONITORING ===
 
-// Enhanced heartbeat with health metrics
+// Enhanced health report endpoint
 app.post('/api/agents/:id/health', requireApiKey, async (req, res) => {
   try {
-    const { status, uptimeSeconds, cpuUsage, memoryUsage, customMetrics } = req.body;
+    const { status = 'healthy', uptimeSeconds, cpuUsage, memoryUsage, customMetrics = {} } = req.body || {};
 
+    if (!VALID_HEALTH_STATUSES.includes(status)) {
+      return res.status(400).json({ error: `Invalid health status. Must be one of: ${VALID_HEALTH_STATUSES.join(', ')}` });
+    }
+
+    const existing = await db.get('SELECT id FROM agents WHERE id = ?', req.params.id);
+    if (!existing) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+
+    await db.run('UPDATE agents SET last_seen = CURRENT_TIMESTAMP WHERE id = ?', req.params.id);
     await db.run(
-      `INSERT OR REPLACE INTO agent_health_status
+      `INSERT INTO agent_health_status
        (agent_id, status, last_heartbeat, uptime_seconds, cpu_usage, memory_usage, custom_metrics, last_updated)
-       VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-      [req.params.id, status || 'healthy', uptimeSeconds || null, cpuUsage || null, memoryUsage || null, JSON.stringify(customMetrics || {})]
+       VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(agent_id) DO UPDATE SET
+         status = excluded.status,
+         last_heartbeat = CURRENT_TIMESTAMP,
+         uptime_seconds = excluded.uptime_seconds,
+         cpu_usage = excluded.cpu_usage,
+         memory_usage = excluded.memory_usage,
+         custom_metrics = excluded.custom_metrics,
+         last_updated = CURRENT_TIMESTAMP`,
+      [req.params.id, status, uptimeSeconds || null, cpuUsage || null, memoryUsage || null, JSON.stringify(customMetrics)]
     );
 
     // Broadcast health status change
     broadcast({
       type: 'agent_health_change',
       agentId: req.params.id,
-      status: status || 'healthy',
+      status,
       metrics: { uptimeSeconds, cpuUsage, memoryUsage, customMetrics }
     });
 
-    res.json({ success: true, message: 'Health status updated' });
+    res.json({ success: true, message: 'Health status updated', status });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1532,12 +1954,15 @@ app.get('/api/agents/:id/health', requireApiKey, async (req, res) => {
 // Health dashboard summary
 app.get('/api/health/dashboard', requireApiKey, async (req, res) => {
   try {
+    const offlineWindow = `-${OFFLINE_THRESHOLD_MINUTES} minutes`;
+
     // Get health summary
-    const healthSummary = await db.all(`
+    const healthSummary = await db.get(`
       SELECT
-        COUNT(*) FILTER (WHERE status = 'healthy') as healthy,
-        COUNT(*) FILTER (WHERE status = 'degraded') as degraded,
-        COUNT(*) FILTER (WHERE status = 'unhealthy') as unhealthy,
+        SUM(CASE WHEN status = 'healthy' THEN 1 ELSE 0 END) as healthy,
+        SUM(CASE WHEN status = 'degraded' THEN 1 ELSE 0 END) as degraded,
+        SUM(CASE WHEN status = 'unhealthy' THEN 1 ELSE 0 END) as unhealthy,
+        SUM(CASE WHEN status = 'offline' THEN 1 ELSE 0 END) as explicit_offline,
         COUNT(*) as total
       FROM agent_health_status
     `);
@@ -1558,19 +1983,20 @@ app.get('/api/health/dashboard', requireApiKey, async (req, res) => {
       ORDER BY a.last_seen DESC
     `);
 
-    // Calculate offline agents (no heartbeat in 5 minutes)
-    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
     const offlineCount = await db.get(
-      'SELECT COUNT(*) as count FROM agents WHERE last_seen < ?',
-      [fiveMinutesAgo]
+      `SELECT COUNT(*) as count
+       FROM agents
+       WHERE datetime(last_seen) < datetime('now', ?)` ,
+      [offlineWindow]
     );
 
     res.json({
-      totalAgents: healthSummary[0].total || 0,
-      healthy: healthSummary[0].healthy || 0,
-      degraded: healthSummary[0].degraded || 0,
-      unhealthy: healthSummary[0].unhealthy || 0,
-      offline: offlineCount.count || 0,
+      version: APP_VERSION,
+      totalAgents: healthSummary?.total || 0,
+      healthy: healthSummary?.healthy || 0,
+      degraded: healthSummary?.degraded || 0,
+      unhealthy: healthSummary?.unhealthy || 0,
+      offline: Math.max(offlineCount?.count || 0, healthSummary?.explicit_offline || 0),
       criticalEvents: activeCatastrophes.length,
       lastCatastrophe: activeCatastrophes[0] || null,
       agentList: agents.map(a => ({
@@ -1590,21 +2016,54 @@ app.get('/api/health/dashboard', requireApiKey, async (req, res) => {
   }
 });
 
+// Mesh stats and observability snapshot
+app.get('/api/stats', requireApiKey, async (req, res) => {
+  try {
+    const [agents, messages, groups, files, updates, catastrophes] = await Promise.all([
+      db.get('SELECT COUNT(*) as count FROM agents'),
+      db.get('SELECT COUNT(*) as count FROM messages'),
+      db.get('SELECT COUNT(*) as count FROM agent_groups'),
+      db.get('SELECT COUNT(*) as count FROM agent_files'),
+      db.get('SELECT COUNT(*) as count FROM system_updates'),
+      db.get('SELECT COUNT(*) as count FROM catastrophe_events WHERE status = ?', ['active'])
+    ]);
+
+    res.json({
+      service: 'agent-mesh-api',
+      version: APP_VERSION,
+      uptimeSeconds: Math.floor((Date.now() - SERVER_STARTED_AT) / 1000),
+      websocketClients: clients.size,
+      bodyLimit: BODY_LIMIT,
+      defaults: {
+        offlineMinutes: OFFLINE_THRESHOLD_MINUTES,
+        messageTimeoutMs: DEFAULT_MESSAGE_TIMEOUT_MS,
+        timeoutCheckIntervalMs: MESSAGE_TIMEOUT_CHECK_INTERVAL_MS
+      },
+      counts: {
+        agents: agents.count,
+        messages: messages.count,
+        groups: groups.count,
+        files: files.count,
+        updates: updates.count,
+        activeCatastrophes: catastrophes.count
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // === TIMEOUT HANDLING UTILITIES ===
 
 // Check for timed out messages (runs periodically)
-const MESSAGE_TIMEOUT = parseInt(process.env.MESSAGE_TIMEOUT || '300000'); // 5 minutes default
-
 async function checkMessageTimeouts() {
   try {
-    const timeoutDate = new Date(Date.now() - MESSAGE_TIMEOUT).toISOString();
-
     const timedOutMessages = await db.all(`
       SELECT * FROM messages
       WHERE status IN ('pending', 'processing')
-      AND created_at < ?
-      AND timeout_ms IS NOT NULL
-    `, timeoutDate);
+        AND timeout_ms IS NOT NULL
+        AND datetime(created_at, '+' || CAST(timeout_ms / 1000 AS INTEGER) || ' seconds') <= CURRENT_TIMESTAMP
+    `);
 
     for (const msg of timedOutMessages) {
       await db.run(
@@ -1617,7 +2076,8 @@ async function checkMessageTimeouts() {
         messageId: msg.id,
         toAgent: msg.to_agent,
         fromAgent: msg.from_agent,
-        createdAt: msg.created_at
+        createdAt: msg.created_at,
+        timeoutMs: msg.timeout_ms
       });
 
       console.log(`[Timeout] Message ${msg.id} timed out for agent ${msg.to_agent}`);
@@ -1632,14 +2092,62 @@ async function checkMessageTimeouts() {
 }
 
 // Run timeout check every minute
-setInterval(checkMessageTimeouts, 60000);
+setInterval(checkMessageTimeouts, MESSAGE_TIMEOUT_CHECK_INTERVAL_MS);
 
-// Health check
+// Basic health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     service: 'agent-mesh-api',
+    version: APP_VERSION,
+    websocketPath: '/ws',
     timestamp: new Date().toISOString()
+  });
+});
+
+// OpenClaw-friendly health summary alias
+app.get('/api/health', requireApiKey, async (req, res) => {
+  try {
+    const dashboard = await db.get(`
+      SELECT
+        (SELECT COUNT(*) FROM agents) as totalAgents,
+        (SELECT COUNT(*) FROM agent_health_status WHERE status = 'healthy') as healthy,
+        (SELECT COUNT(*) FROM agent_health_status WHERE status = 'degraded') as degraded,
+        (SELECT COUNT(*) FROM agent_health_status WHERE status = 'unhealthy') as unhealthy,
+        (SELECT COUNT(*) FROM catastrophe_events WHERE status = 'active') as activeCatastrophes
+    `);
+
+    res.json({
+      status: 'ok',
+      service: 'agent-mesh-api',
+      version: APP_VERSION,
+      totalAgents: dashboard.totalAgents || 0,
+      healthy: dashboard.healthy || 0,
+      degraded: dashboard.degraded || 0,
+      unhealthy: dashboard.unhealthy || 0,
+      activeCatastrophes: dashboard.activeCatastrophes || 0,
+      websocketClients: clients.size,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// OpenClaw compatibility descriptor
+app.get('/api/openclaw/compat', requireApiKey, (req, res) => {
+  res.json({
+    service: 'agent-mesh-api',
+    version: APP_VERSION,
+    compatibility: {
+      openclaw: true,
+      transport: ['rest', 'websocket', 'mcp-via-sidecar'],
+      supportsAgentNames: true,
+      supportsAgentIds: true,
+      healthEndpoint: '/api/health',
+      statsEndpoint: '/api/stats',
+      websocketEndpoint: `/ws`
+    }
   });
 });
 
