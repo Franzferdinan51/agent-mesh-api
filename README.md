@@ -4,7 +4,7 @@
 
 A REST API, WebSocket event bus, and MCP sidecar for autonomous agents that need to communicate, collaborate, and share resources across a distributed mesh.
 
-**v3.0.0 — OpenClaw compatibility refresh** (2026-04-19): Full bug pass, name-or-ID resolution on all endpoints, OpenClaw compatibility endpoints, structured health/stats APIs.
+**v3.1.0 — Phantom Bridge + Agent Teams Integration** (2026-04-21): Full bug pass, name-or-ID resolution on all endpoints, OpenClaw compatibility endpoints, structured health/stats APIs.
 
 ---
 
@@ -49,6 +49,60 @@ The following specifications have been created to guide future development:
 | Federation Support | ✅ | agentmesh-federation-spec.md |
 
 See `memory/` directory for detailed specifications.
+
+### v3.1.0 Agent Teams Integration
+- ✅ **Reticulum Phantom Bridge:** Decentralized P2P file transfer via `/api/phantom/*` routes
+- ✅ **Auto-start:** Integrated into Agent Teams `start-all.sh` (port 4000)
+- ✅ **OpenClaw Tools:** 23 mesh tools in `tools.js`, 16 MCP tools in Python MCP server
+- ✅ **Group broadcast fix:** Name-or-ID resolution now consistent across all group routes
+
+---
+
+## 🌐 Reticulum Phantom — Decentralized File Transfer
+
+The mesh includes an optional **Reticulum Phantom** bridge for P2P encrypted file sharing.
+
+### Requirements
+```bash
+# Install Reticulum + Phantom (macOS/Linux)
+pip3 install "rns>=0.9.0" rich textual msgpack
+
+# Or use the pre-built venv
+/tmp/rns-venv/bin/python /path/to/phantom.py --help
+```
+
+### Phantom Routes (v3.1.0)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/phantom/seed` | Seed a file (creates .ghost, starts sharing) |
+| POST | `/api/phantom/download` | Download via .ghost file from mesh |
+| GET | `/api/phantom/status` | Check Reticulum connectivity |
+| GET | `/api/phantom/identity` | Get mesh node identity/hash |
+| POST | `/api/phantom/seed-all` | Seed all files in a directory |
+| GET | `/api/phantom/info` | Get .ghost file metadata |
+
+### Example: Seed a File
+```bash
+curl -X POST http://localhost:4000/api/phantom/seed \
+  -H "X-API-Key: openclaw-mesh-default-key" \
+  -d '{"filepath": "/path/to/file.zip"}'
+# Returns: { ghostPath, ghostHash, dest }
+```
+
+### Example: Download a File
+```bash
+curl -X POST http://localhost:4000/api/phantom/download \
+  -H "X-API-Key: openclaw-mesh-default-key" \
+  -d '{"ghostFile": "/path/to/file.zip.ghost", "outputDir": "~/Downloads"}'
+```
+
+### How It Works
+```
+Traditional (Base64):  upload → mesh DB → download (centralized)
+Phantom (P2P):         seed → .ghost → share hash → download from peers (decentralized)
+```
+Ghost files are msgpack-encoded with SHA-256 chunk verification. No source paths exposed.
 
 ## 🚀 Quick Start
 

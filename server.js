@@ -1289,6 +1289,8 @@ app.get('/api/groups/:groupId/agents', requireApiKey, async (req, res) => {
 // Send message to entire group
 app.post('/api/groups/:groupId/broadcast', requireApiKey, async (req, res) => {
   try {
+    // Resolve name-or-ID to actual group
+    const group = await requireGroup(req.params.groupId, 'group');
     const from = req.body.from || req.body.fromAgentId || req.body.sender;
     const { content, messageType = 'direct' } = req.body;
 
@@ -1303,7 +1305,7 @@ app.post('/api/groups/:groupId/broadcast', requireApiKey, async (req, res) => {
       SELECT agm.agent_id
       FROM agent_group_members agm
       WHERE agm.group_id = ? AND agm.agent_id != ?
-    `, [req.params.groupId, fromAgent.id]);
+    `, [group.id, fromAgent.id]);
 
     if (agents.length === 0) {
       return res.status(404).json({ error: 'No agents found in group' });
@@ -1321,7 +1323,7 @@ app.post('/api/groups/:groupId/broadcast', requireApiKey, async (req, res) => {
 
     broadcast({
       type: 'group_broadcast',
-      groupId: req.params.groupId,
+      groupId: group.id,
       from: fromAgent.id,
       fromName: fromAgent.name,
       content,
