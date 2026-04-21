@@ -504,6 +504,269 @@ export const tools = {
 
 };
 
+  // ═══════════════════════════════════════════════════════════
+  // v4.0: Presence & Capability Routing
+
+  async mesh_presence_update(params = {}) {
+    try {
+      const { state, statusMessage, capabilities, bandwidthUpload, bandwidthDownload, storageFreeGb } = params;
+      const response = await api.patch('/api/agents/' + agentId + '/presence', { state, statusMessage, capabilities, bandwidthUpload, bandwidthDownload, storageFreeGb });
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  async mesh_presence_get(params = {}) {
+    try {
+      const { targetAgentId } = params;
+      const response = await api.get('/api/agents/' + targetAgentId + '/presence');
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  async mesh_presence_list(params = {}) {
+    try {
+      const { state, capability } = params;
+      const p = {}; if (state) p.state = state; if (capability) p.capability = capability;
+      const response = await api.get('/api/presence', { params: p });
+      return { success: true, agents: response.data };
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  async mesh_route_task(params = {}) {
+    try {
+      const { task, requiresCapabilities, priority } = params;
+      const response = await api.post('/api/mesh/route', { task, requiresCapabilities, priority });
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  // v4.0: Threads / Conversation Context
+
+  async mesh_thread_create(params = {}) {
+    try {
+      const { groupId, parentId, title, context } = params;
+      const response = await api.post('/api/threads', { groupId, parentId, title, context, createdBy: agentId });
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  async mesh_thread_list(params = {}) {
+    try {
+      const { groupId, parentId } = params;
+      const p = {}; if (groupId) p.groupId = groupId; if (parentId) p.parentId = parentId;
+      const response = await api.get('/api/threads', { params: p });
+      return { success: true, threads: response.data };
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  async mesh_thread_get(params = {}) {
+    try {
+      const { threadId } = params;
+      const response = await api.get('/api/threads/' + threadId);
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  async mesh_thread_message(params = {}) {
+    try {
+      const { threadId, to, content, intent, priority } = params;
+      const response = await api.post('/api/threads/' + threadId + '/messages', { from: agentId, to, content, intent, priority });
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  // v4.0: Semantic Reactions
+
+  async mesh_reaction_add(params = {}) {
+    try {
+      const { messageId, emoji } = params;
+      const response = await api.post('/api/messages/' + messageId + '/reactions', { agentId, emoji });
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  async mesh_reaction_list(params = {}) {
+    try {
+      const { messageId } = params;
+      const response = await api.get('/api/messages/' + messageId + '/reactions');
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  // v4.0: Group Activity Feed
+
+  async mesh_activity_log(params = {}) {
+    try {
+      const { groupId, action, targetType, targetId, metadata } = params;
+      const response = await api.post('/api/groups/' + groupId + '/activity', { actorId: agentId, action, targetType, targetId, metadata });
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  async mesh_activity_feed(params = {}) {
+    try {
+      const { groupId, limit } = params;
+      const response = await api.get('/api/groups/' + groupId + '/activity', { params: { limit: limit || 50 } });
+      return { success: true, feed: response.data };
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  // v4.0: Agent Subscriptions
+
+  async mesh_subscribe(params = {}) {
+    try {
+      const { groupId, notifyJoin, notifyLeave, notifyBroadcast, notifyTask, notifyMessage } = params;
+      const response = await api.post('/api/groups/' + groupId + '/subscribe', { agentId, notifyJoin, notifyLeave, notifyBroadcast, notifyTask, notifyMessage });
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  async mesh_subscriptions_list(params = {}) {
+    try {
+      const { targetAgentId } = params;
+      const response = await api.get('/api/agents/' + targetAgentId + '/subscriptions');
+      return { success: true, subscriptions: response.data };
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  // v4.0: Task State Tracking & Handoffs
+
+  async mesh_task_create(params = {}) {
+    try {
+      const { groupId, title, description, priority, ownerId, assignedId, dependsOn, context } = params;
+      const response = await api.post('/api/tasks', { groupId, title, description, priority, ownerId, assignedId, dependsOn, context, createdBy: agentId });
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  async mesh_task_update(params = {}) {
+    try {
+      const { taskId, state, assignedId, result, priority } = params;
+      const response = await api.patch('/api/tasks/' + taskId, { state, assignedId, result, priority });
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  async mesh_task_list(params = {}) {
+    try {
+      const { groupId, state, assignedId, ownerId } = params;
+      const p = {}; if (groupId) p.groupId = groupId; if (state) p.state = state; if (assignedId) p.assignedId = assignedId; if (ownerId) p.ownerId = ownerId;
+      const response = await api.get('/api/tasks', { params: p });
+      return { success: true, tasks: response.data };
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  async mesh_task_handoff(params = {}) {
+    try {
+      const { taskId, toAgentId, note } = params;
+      const response = await api.post('/api/tasks/' + taskId + '/handoff', { toAgentId, note });
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  // v4.0: Scheduled Messages
+
+  async mesh_message_schedule(params = {}) {
+    try {
+      const { to, toGroup, content, intent, priority, sendAt } = params;
+      const response = await api.post('/api/messages/scheduled', { from: agentId, to, toGroup, content, intent, priority, sendAt });
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  async mesh_scheduled_list() {
+    try {
+      const response = await api.get('/api/messages/scheduled');
+      return { success: true, scheduled: response.data };
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  async mesh_scheduled_cancel(params = {}) {
+    try {
+      const { messageId } = params;
+      const response = await api.delete('/api/messages/scheduled/' + messageId);
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  // v4.0: Capability Directory & Decisions
+
+  async mesh_capability_directory() {
+    try {
+      const response = await api.get('/api/capabilities');
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  async mesh_decision_log(params = {}) {
+    try {
+      const { groupId, content, context } = params;
+      const response = await api.post('/api/decisions', { groupId, content, context, decidedBy: agentId });
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  async mesh_decisions_get(params = {}) {
+    try {
+      const { groupId, limit } = params;
+      const p = {}; if (groupId) p.groupId = groupId; if (limit) p.limit = limit;
+      const response = await api.get('/api/decisions', { params: p });
+      return { success: true, decisions: response.data };
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  // v4.0: Group Invitations
+
+  async mesh_group_request(params = {}) {
+    try {
+      const { groupId } = params;
+      const response = await api.post('/api/groups/' + groupId + '/request', { agentId });
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  async mesh_group_invite_respond(params = {}) {
+    try {
+      const { groupId, agentId: tAgentId, status } = params;
+      const response = await api.patch('/api/groups/' + groupId + '/request/' + tAgentId, { status });
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  async mesh_group_requests(params = {}) {
+    try {
+      const { groupId } = params;
+      const response = await api.get('/api/groups/' + groupId + '/requests');
+      return { success: true, requests: response.data };
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  // v4.0: Meta-Agent Orchestration
+
+  async mesh_meta_orchestrate(params = {}) {
+    try {
+      const { action, payload } = params;
+      const response = await api.post('/api/mesh/orchestrate', { action, payload, agentId });
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  async mesh_meta_summarize(params = {}) {
+    try {
+      const { groupId } = params;
+      const response = await api.post('/api/mesh/orchestrate', { action: 'summarize_group', payload: { groupId }, agentId });
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+  async mesh_meta_status() {
+    try {
+      const response = await api.post('/api/mesh/orchestrate', { action: 'mesh_status', payload: {}, agentId });
+      return response.data;
+    } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+  },
+
+
 // Load saved agent ID on startup
 try {
   const savedId = await fs.readFile(

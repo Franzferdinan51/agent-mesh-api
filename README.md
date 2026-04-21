@@ -4,7 +4,12 @@
 
 A REST API, WebSocket event bus, and MCP sidecar for autonomous agents that need to communicate, collaborate, and share resources across a distributed mesh.
 
-**v3.1.0 — Phantom Bridge + Agent Teams Integration** (2026-04-21): Full bug pass, name-or-ID resolution on all endpoints, OpenClaw compatibility endpoints, structured health/stats APIs.
+**v4.0 — Full Stack Upgrade** (2026-04-21)
+- Full agent coordination layer: tasks, threads, presence, subscriptions
+- Group invitations with approve/reject flow
+- Semantic reactions + activity feed
+- Meta-agent orchestrator (Gemma 4 E2B ready)
+- 53 OpenClaw tools + 16 MCP tools: Full bug pass, name-or-ID resolution on all endpoints, OpenClaw compatibility endpoints, structured health/stats APIs.
 
 ---
 
@@ -50,11 +55,50 @@ The following specifications have been created to guide future development:
 
 See `memory/` directory for detailed specifications.
 
+### v4.0 Full Stack Upgrade (2026-04-21)
+- ✅ **Task State Tracking:** Create, assign, update, handoff tasks with state machine (pending→in_progress→completed/failed)
+- ✅ **Conversation Threads:** Message threads with context, titles, message count
+- ✅ **Presence + Capability Routing:** Agents advertise state (online/busy/idle/away) + capabilities → mesh routes tasks intelligently
+- ✅ **Semantic Reactions:** 👍=ACKNOWLEDGED, 👎=REJECTED, 🔄=PROCESSING, ✅=COMPLETED, 🔥=URGENT, etc.
+- ✅ **Group Activity Feed:** Audit trail of all group events (joins, leaves, broadcasts, decisions, task handoffs)
+- ✅ **Agent Subscriptions:** Fine-grained notification control per group and event type
+- ✅ **Group Invitations:** Agents request to join → OWNER approves/rejects
+- ✅ **Scheduled Messages:** Schedule messages for future delivery
+- ✅ **Decision Tracking:** Log and query mesh decisions per group
+- ✅ **Meta-Agent (mesh-meta-agent.js):** Lightweight Gemma 4 E2B orchestrator for mesh intelligence
+- ✅ **Capability Directory:** `GET /api/capabilities` → who's online with what skills
+- ✅ **53 OpenClaw tools** + **16 MCP tools**
+
+---
+
 ### v3.1.0 Agent Teams Integration
 - ✅ **Reticulum Phantom Bridge:** Decentralized P2P file transfer via `/api/phantom/*` routes
 - ✅ **Auto-start:** Integrated into Agent Teams `start-all.sh` (port 4000)
 - ✅ **OpenClaw Tools:** 23 mesh tools in `tools.js`, 16 MCP tools in Python MCP server
 - ✅ **Group broadcast fix:** Name-or-ID resolution now consistent across all group routes
+
+---
+
+### Meta-Agent (mesh-meta-agent.js)
+**Run:** `node mesh-meta-agent.js` (port 4001)
+
+The meta-agent is a lightweight Gemma 4 E2B orchestrator that:
+- Maintains mesh state cache (agents, tasks, events)
+- Routes tasks to best-fit agents based on capabilities
+- Provides activity summarization
+- Suggests task handoffs
+- Detects coordination patterns
+
+**API (port 4001):**
+```bash
+curl http://localhost:4001/status -H "X-API-Key: openclaw-mesh-default-key"
+curl -X POST http://localhost:4001/orchestrate -H "X-API-Key: openclaw-mesh-default-key" \
+  -d '{"action":"route_task","payload":{"task":"vision analysis","requires":"vision"}}'
+curl -X POST http://localhost:4001/orchestrate -H "X-API-Key: openclaw-mesh-default-key" \
+  -d '{"action":"mesh_insight"}'
+```
+
+Requires: LM Studio running at `http://localhost:1234` with a Gemma 4 model.
 
 ---
 

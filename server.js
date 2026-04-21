@@ -327,6 +327,138 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_agent_health_status ON agent_health_status(status, last_updated DESC);
   `);
 
+
+    // ---- v4.0: Presence & Capabilities ------
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_presence (
+        agent_id TEXT PRIMARY KEY,
+        state TEXT DEFAULT 'offline',
+        status_message TEXT DEFAULT '',
+        last_ping INTEGER DEFAULT 0,
+        capabilities TEXT DEFAULT '[]',
+        bandwidth_upload INTEGER DEFAULT 0,
+        bandwidth_download INTEGER DEFAULT 0,
+        storage_free_gb REAL DEFAULT 0
+      )
+    `);
+    await db.exec(`CREATE INDEX IF NOT EXISTS idx_presence_state ON agent_presence(state)`);
+
+    // ---- v4.0: Threads / Conversations ------
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_threads (
+        id TEXT PRIMARY KEY,
+        group_id TEXT,
+        parent_id TEXT,
+        title TEXT DEFAULT '',
+        context TEXT DEFAULT '',
+        created_by TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now')),
+        message_count INTEGER DEFAULT 0,
+        last_message_at TEXT
+      )
+    `);
+    await db.exec(`CREATE INDEX IF NOT EXISTS idx_threads_group ON agent_threads(group_id)`);
+    await db.exec(`CREATE INDEX IF NOT EXISTS idx_threads_parent ON agent_threads(parent_id)`);
+
+    // ---- v4.0: Reactions ------
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_reactions (
+        id TEXT PRIMARY KEY,
+        message_id TEXT,
+        agent_id TEXT,
+        emoji TEXT NOT NULL,
+        semantic TEXT DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(message_id, agent_id, emoji)
+      )
+    `);
+    await db.exec(`CREATE INDEX IF NOT EXISTS idx_reactions_message ON agent_reactions(message_id)`);
+
+    // ---- v4.0: Group Activity Feed ------
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_activity (
+        id TEXT PRIMARY KEY,
+        group_id TEXT,
+        actor_id TEXT,
+        action TEXT NOT NULL,
+        target_type TEXT DEFAULT '',
+        target_id TEXT DEFAULT '',
+        metadata TEXT DEFAULT '{}',
+        created_at TEXT DEFAULT (datetime('now'))
+      )
+    `);
+    await db.exec(`CREATE INDEX IF NOT EXISTS idx_activity_group ON agent_activity(group_id, created_at DESC)`);
+
+    // ---- v4.0: Agent Subscriptions ------
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_subscriptions (
+        agent_id TEXT NOT NULL,
+        group_id TEXT NOT NULL,
+        notify_join INTEGER DEFAULT 1,
+        notify_leave INTEGER DEFAULT 1,
+        notify_broadcast INTEGER DEFAULT 1,
+        notify_task INTEGER DEFAULT 1,
+        notify_message INTEGER DEFAULT 1,
+        created_at TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (agent_id, group_id)
+      )
+    `);
+
+    // ---- v4.0: Task State Tracking ------
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_tasks (
+        id TEXT PRIMARY KEY,
+        group_id TEXT,
+        title TEXT DEFAULT '',
+        description TEXT DEFAULT '',
+        state TEXT DEFAULT 'pending',
+        priority INTEGER DEFAULT 5,
+        owner_id TEXT,
+        assigned_id TEXT,
+        depends_on TEXT DEFAULT '[]',
+        context TEXT DEFAULT '',
+        result TEXT DEFAULT '',
+        created_by TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now')),
+        started_at TEXT,
+        completed_at TEXT
+      )
+    `);
+    await db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_state ON agent_tasks(state)`);
+    await db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_assigned ON agent_tasks(assigned_id)`);
+
+    // ---- v4.0: Scheduled Messages ------
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS scheduled_messages (
+        id TEXT PRIMARY KEY,
+        from_agent TEXT,
+        to_agent TEXT,
+        to_group TEXT,
+        content TEXT NOT NULL,
+        intent TEXT DEFAULT 'direct',
+        priority INTEGER DEFAULT 0,
+        scheduled_at TEXT NOT NULL,
+        status TEXT DEFAULT 'pending',
+        created_at TEXT DEFAULT (datetime('now'))
+      )
+    `);
+    await db.exec(`CREATE INDEX IF NOT EXISTS idx_scheduled_status ON scheduled_messages(status, scheduled_at)`);
+
+    // ---- v4.0: Group Invitations ------
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_group_invitations (
+        id TEXT PRIMARY KEY,
+        group_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        status TEXT DEFAULT 'pending',
+        created_at TEXT DEFAULT (datetime('now')),
+        responded_at TEXT,
+        UNIQUE(group_id, agent_id)
+      )
+    `);
+
   // Verify database is writable
   try {
     await db.run('SELECT COUNT(*) FROM agents');
@@ -2283,6 +2415,469 @@ async function checkMessageTimeouts() {
 
 // Run timeout check every minute
 setInterval(checkMessageTimeouts, MESSAGE_TIMEOUT_CHECK_INTERVAL_MS);
+
+// ═══════════════════════════════════════════════════════════════
+// v4.0: PRESENCE & CAPABILITY ROUTING
+// ═══════════════════════════════════════════════════════════════
+
+const REACTION_SEMANTICS = {
+  '👍': 'ACKNOWLEDGED', '👎': 'REJECTED', '🔄': 'PROCESSING',
+  '✅': 'COMPLETED', '❌': 'FAILED', '⚠️': 'WARNING',
+  '🎯': 'TARGETED', '💡': 'IDEA', '🔥': 'URGENT',
+  '🤝': 'AGREED', '❓': 'QUESTION', '📌': 'PINNED'
+};
+
+// ─── Update own presence ────────────────────────────────────────
+app.patch('/api/agents/:id/presence', requireApiKey, async (req, res) => {
+  try {
+    const agent = await requireAgent(req.params.id, 'agent');
+    const { state, statusMessage, capabilities, bandwidthUpload, bandwidthDownload, storageFreeGb } = req.body;
+    const validStates = ['online','busy','idle','away','offline'];
+    const s = validStates.includes(state) ? state : 'online';
+    const caps = Array.isArray(capabilities) ? JSON.stringify(capabilities) : (typeof capabilities === 'string' ? capabilities : '[]');
+    await db.run(`INSERT OR REPLACE INTO agent_presence (agent_id,state,status_message,last_ping,capabilities,bandwidth_upload,bandwidth_download,storage_free_gb) VALUES (?,?,?,?,?,?,?,?)`,
+      [agent.id, s, statusMessage||'', Date.now(), caps, bandwidthUpload||0, bandwidthDownload||0, storageFreeGb||0]);
+    broadcast({ type: 'presence_changed', agentId: agent.id, state: s, statusMessage: statusMessage||'' });
+    res.json({ success: true, state: s });
+  } catch (e) { res.status(e.statusCode||500).json({ error: e.message }); }
+});
+
+// ─── Get agent presence ────────────────────────────────────────
+app.get('/api/agents/:id/presence', requireApiKey, async (req, res) => {
+  try {
+    const p = await db.get('SELECT * FROM agent_presence WHERE agent_id = ?', [req.params.id]);
+    res.json(p ? { ...p, capabilities: JSON.parse(p.capabilities||'[]') } : { agent_id: req.params.id, state: 'offline', status_message: '', capabilities: [] });
+  } catch (e) { res.status(e.statusCode||500).json({ error: e.message }); }
+});
+
+// ─── List all presence ──────────────────────────────────────────
+app.get('/api/presence', requireApiKey, async (req, res) => {
+  try {
+    const { state, capability } = req.query;
+    let sql = 'SELECT ap.*, a.name as agent_name FROM agent_presence ap JOIN agents a ON ap.agent_id = a.id';
+    const params = [], conds = [];
+    if (state) { conds.push('ap.state = ?'); params.push(state); }
+    if (capability) { conds.push('ap.capabilities LIKE ?'); params.push(`%"${capability}"%`); }
+    if (conds.length) sql += ' WHERE ' + conds.join(' AND ');
+    sql += ' ORDER BY ap.last_ping DESC';
+    const rows = await db.all(sql, params);
+    res.json(rows.map(r => ({ ...r, capabilities: JSON.parse(r.capabilities||'[]') })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Route task to best agent ───────────────────────────────────
+app.post('/api/mesh/route', requireApiKey, async (req, res) => {
+  try {
+    const { task, requiresCapabilities, priority } = req.body;
+    let sql = `SELECT ap.*, a.name FROM agent_presence ap JOIN agents a ON ap.agent_id = a.id WHERE ap.state NOT IN ('offline','away')`;
+    const params = [];
+    if (requiresCapabilities && requiresCapabilities.length) {
+      const caps = requiresCapabilities.map(c => `ap.capabilities LIKE '%"${c}"%'`).join(' AND ');
+      sql += ' AND ' + caps;
+    }
+    sql += ' ORDER BY ap.last_ping DESC LIMIT 5';
+    const candidates = await db.all(sql, params);
+    const scored = candidates.map(a => {
+      const ac = JSON.parse(a.capabilities||'[]');
+      return { ...a, capabilities: ac, score: ac.filter(c => requiresCapabilities&&requiresCapabilities.includes(c)).length + (a.state==='online'?10:0) };
+    }).sort((a,b) => b.score - a.score);
+    if (!scored.length) return res.json({ success: false, error: 'No agents available', candidates: [] });
+    const taskId = uuidv4(), assignedId = scored[0].agent_id;
+    await db.run(`INSERT INTO agent_tasks (id,title,state,owner_id,assigned_id,priority,context) VALUES (?,?,?,?,?,?,?)`,
+      [taskId, task||'Routed task', 'pending', null, assignedId, priority||5, JSON.stringify({ requiresCapabilities })]);
+    broadcast({ type: 'task_routed', taskId, agentId: assignedId, task, priority: priority||5 });
+    res.json({ success: true, taskId, routedTo: scored[0].name, candidates: scored.slice(0,3).map(a=>({name:a.name, score:a.score, state:a.state})) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// v4.0: THREADS / CONVERSATION CONTEXT
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Create thread ──────────────────────────────────────────────
+app.post('/api/threads', requireApiKey, async (req, res) => {
+  try {
+    const { groupId, parentId, title, context, createdBy } = req.body;
+    const id = uuidv4();
+    const agent = createdBy ? await resolveAgent(createdBy) : null;
+    await db.run(`INSERT INTO agent_threads (id,group_id,parent_id,title,context,created_by) VALUES (?,?,?,?,?,?)`,
+      [id, groupId||null, parentId||null, title||'', context||'', agent?.id||null]);
+    res.json({ success: true, id, title: title||'' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── List threads ───────────────────────────────────────────────
+app.get('/api/threads', requireApiKey, async (req, res) => {
+  try {
+    const { groupId, parentId } = req.query;
+    let sql = 'SELECT * FROM agent_threads WHERE 1=1';
+    const params = [];
+    if (groupId) { sql += ' AND group_id = ?'; params.push(groupId); }
+    if (parentId) { sql += ' AND parent_id = ?'; params.push(parentId); }
+    sql += ' ORDER BY updated_at DESC LIMIT 50';
+    res.json(await db.all(sql, params));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Get thread + messages ──────────────────────────────────────
+app.get('/api/threads/:id', requireApiKey, async (req, res) => {
+  try {
+    const thread = await db.get('SELECT * FROM agent_threads WHERE id = ?', [req.params.id]);
+    if (!thread) return res.status(404).json({ error: 'Thread not found' });
+    const messages = await db.all(
+      'SELECT m.*, a.name as from_name FROM messages m LEFT JOIN agents a ON m.from_agent=a.id WHERE m.thread_id = ? ORDER BY m.created_at ASC LIMIT 200',
+      [req.params.id]);
+    res.json({ thread, messages });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Send message in thread ────────────────────────────────────
+app.post('/api/threads/:id/messages', requireApiKey, async (req, res) => {
+  try {
+    const thread = await db.get('SELECT * FROM agent_threads WHERE id = ?', [req.params.id]);
+    if (!thread) return res.status(404).json({ error: 'Thread not found' });
+    const { from, to, content, intent, priority } = req.body;
+    if (!from || !content) return res.status(400).json({ error: 'from and content required' });
+    const fromAgent = await requireAgent(from, 'agent');
+    const id = uuidv4();
+    await db.run(`INSERT INTO messages (id,from_agent,to_agent,content,message_type,thread_id,intent,status,timeout_ms) VALUES (?,?,?,?,?,?,?,?,?)`,
+      [id, fromAgent.id, to||null, content, to?'direct':'broadcast', req.params.id, intent||'RESPONSE', 'delivered', priority?5000:300000]);
+    await db.run('UPDATE agent_threads SET message_count=message_count+1, last_message_at=datetime("now"), updated_at=datetime("now") WHERE id=?', [req.params.id]);
+    broadcast({ type: 'thread_message', threadId: req.params.id, messageId: id, from: fromAgent.id, fromName: fromAgent.name, content, intent: intent||'RESPONSE' });
+    res.json({ success: true, id, threadId: req.params.id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// v4.0: REACTIONS (semantic emoji)
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Add reaction ──────────────────────────────────────────────
+app.post('/api/messages/:id/reactions', requireApiKey, async (req, res) => {
+  try {
+    const { agentId, emoji } = req.body;
+    if (!agentId || !emoji) return res.status(400).json({ error: 'agentId and emoji required' });
+    const agent = await requireAgent(agentId, 'agent');
+    const id = uuidv4(), semantic = REACTION_SEMANTICS[emoji] || 'CUSTOM';
+    await db.run(`INSERT OR REPLACE INTO agent_reactions (id,message_id,agent_id,emoji,semantic) VALUES (?,?,?,?,?)`,
+      [id, req.params.id, agent.id, emoji, semantic]);
+    broadcast({ type: 'reaction_added', messageId: req.params.id, agentId: agent.id, emoji, semantic });
+    res.json({ success: true, id, semantic });
+  } catch (e) { res.status(e.statusCode||500).json({ error: e.message }); }
+});
+
+// ─── Get reactions ─────────────────────────────────────────────
+app.get('/api/messages/:id/reactions', requireApiKey, async (req, res) => {
+  try {
+    const reactions = await db.all(
+      `SELECT r.*, a.name as agent_name FROM agent_reactions r JOIN agents a ON r.agent_id=a.id WHERE r.message_id=?`, [req.params.id]);
+    const semantics = {};
+    reactions.forEach(r => { if (!semantics[r.semantic]) semantics[r.semantic]=[]; semantics[r.semantic].push(r.agent_name); });
+    res.json({ reactions, semantics });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// v4.0: GROUP ACTIVITY FEED
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Log activity ──────────────────────────────────────────────
+app.post('/api/groups/:groupId/activity', requireApiKey, async (req, res) => {
+  try {
+    const group = await requireGroup(req.params.groupId, 'group');
+    const { actorId, action, targetType, targetId, metadata } = req.body;
+    if (!action) return res.status(400).json({ error: 'action required' });
+    const id = uuidv4();
+    await db.run(`INSERT INTO agent_activity (id,group_id,actor_id,action,target_type,target_id,metadata) VALUES (?,?,?,?,?,?,?)`,
+      [id, group.id, actorId||null, action, targetType||'', targetId||'', JSON.stringify(metadata||{})]);
+    broadcast({ type: 'group_activity', groupId: group.id, action, actorId: actorId||null });
+    res.json({ success: true, id });
+  } catch (e) { res.status(e.statusCode||500).json({ error: e.message }); }
+});
+
+// ─── Get activity feed ─────────────────────────────────────────
+app.get('/api/groups/:groupId/activity', requireApiKey, async (req, res) => {
+  try {
+    const group = await requireGroup(req.params.groupId, 'group');
+    const { limit=50 } = req.query;
+    const rows = await db.all(
+      `SELECT aa.*, a.name as actor_name FROM agent_activity aa LEFT JOIN agents a ON aa.actor_id=a.id WHERE aa.group_id=? ORDER BY aa.created_at DESC LIMIT ?`,
+      [group.id, Math.min(Number(limit),200)]);
+    res.json(rows.map(r=>({...r, metadata: JSON.parse(r.metadata||'{}')})));
+  } catch (e) { res.status(e.statusCode||500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// v4.0: AGENT SUBSCRIPTIONS
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Subscribe to group ─────────────────────────────────────────
+app.post('/api/groups/:groupId/subscribe', requireApiKey, async (req, res) => {
+  try {
+    const group = await requireGroup(req.params.groupId, 'group');
+    const { agentId, notifyJoin, notifyLeave, notifyBroadcast, notifyTask, notifyMessage } = req.body;
+    const agent = agentId ? await resolveAgent(agentId) : null;
+    await db.run(`INSERT OR REPLACE INTO agent_subscriptions (agent_id,group_id,notify_join,notify_leave,notify_broadcast,notify_task,notify_message) VALUES (?,?,?,?,?,?,?)`,
+      [agent?.id||agentId, group.id, notifyJoin??1, notifyLeave??1, notifyBroadcast??1, notifyTask??1, notifyMessage??1]);
+    res.json({ success: true, subscribedTo: group.name });
+  } catch (e) { res.status(e.statusCode||500).json({ error: e.message }); }
+});
+
+// ─── Get subscriptions ────────────────────────────────────────
+app.get('/api/agents/:id/subscriptions', requireApiKey, async (req, res) => {
+  try {
+    const rows = await db.all(
+      `SELECT s.*, g.name as group_name FROM agent_subscriptions s JOIN agent_groups g ON s.group_id=g.id WHERE s.agent_id=?`, [req.params.id]);
+    res.json(rows);
+  } catch (e) { res.status(e.statusCode||500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// v4.0: TASK STATE TRACKING
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Create task ───────────────────────────────────────────────
+app.post('/api/tasks', requireApiKey, async (req, res) => {
+  try {
+    const { groupId, title, description, priority, ownerId, assignedId, dependsOn, context, createdBy } = req.body;
+    const id = uuidv4();
+    const owner = ownerId ? await resolveAgent(ownerId) : null;
+    const assigned = assignedId ? await resolveAgent(assignedId) : null;
+    const creator = createdBy ? await resolveAgent(createdBy) : null;
+    await db.run(`INSERT INTO agent_tasks (id,group_id,title,description,state,priority,owner_id,assigned_id,depends_on,context,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      [id, groupId||null, title||'', description||'', 'pending', priority||5, owner?.id||null, assigned?.id||null, JSON.stringify(dependsOn||[]), context||'', creator?.id||null]);
+    if (groupId) broadcast({ type: 'task_created', taskId: id, title, groupId, assignedId: assigned?.id||assignedId, priority: priority||5 });
+    res.json({ success: true, id, state: 'pending' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Update task state ─────────────────────────────────────────
+app.patch('/api/tasks/:id', requireApiKey, async (req, res) => {
+  try {
+    const task = await db.get('SELECT * FROM agent_tasks WHERE id=?', [req.params.id]);
+    if (!task) return res.status(404).json({ error: 'Task not found' });
+    const { state, assignedId, result, priority } = req.body;
+    const validStates = ['pending','in_progress','completed','failed','cancelled'];
+    const updates = [], params = [];
+    if (state && validStates.includes(state)) {
+      updates.push('state=?'); params.push(state);
+      if (state==='completed'||state==='failed') updates.push('completed_at=datetime("now")');
+      if (state==='in_progress') updates.push('started_at=datetime("now")');
+    }
+    if (assignedId !== undefined) { const a = await resolveAgent(assignedId); updates.push('assigned_id=?'); params.push(a?.id||null); }
+    if (priority !== undefined) { updates.push('priority=?'); params.push(priority); }
+    if (result !== undefined) { updates.push('result=?'); params.push(result); }
+    updates.push('updated_at=datetime("now")');
+    params.push(req.params.id);
+    await db.run(`UPDATE agent_tasks SET ${updates.join(', ')} WHERE id=?`, params);
+    broadcast({ type: 'task_updated', taskId: req.params.id, state, assignedId: assignedId||task.assigned_id, result });
+    res.json({ success: true, taskId: req.params.id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Get tasks ─────────────────────────────────────────────────
+app.get('/api/tasks', requireApiKey, async (req, res) => {
+  try {
+    const { groupId, state, assignedId, ownerId } = req.query;
+    let sql = 'SELECT t.*, a.name as assigned_name, o.name as owner_name FROM agent_tasks t LEFT JOIN agents a ON t.assigned_id=a.id LEFT JOIN agents o ON t.owner_id=o.id WHERE 1=1';
+    const params = [];
+    if (groupId) { sql += ' AND t.group_id=?'; params.push(groupId); }
+    if (state) { sql += ' AND t.state=?'; params.push(state); }
+    if (assignedId) { sql += ' AND t.assigned_id=?'; params.push(assignedId); }
+    if (ownerId) { sql += ' AND t.owner_id=?'; params.push(ownerId); }
+    sql += ' ORDER BY t.priority DESC, t.created_at DESC LIMIT 100';
+    const rows = await db.all(sql, params);
+    res.json(rows.map(r=>({...r, depends_on: JSON.parse(r.depends_on||'[]')})));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Handoff task ─────────────────────────────────────────────
+app.post('/api/tasks/:id/handoff', requireApiKey, async (req, res) => {
+  try {
+    const task = await db.get('SELECT * FROM agent_tasks WHERE id=?', [req.params.id]);
+    if (!task) return res.status(404).json({ error: 'Task not found' });
+    const { toAgentId, note } = req.body;
+    const toAgent = await requireAgent(toAgentId, 'agent');
+    await db.run('UPDATE agent_tasks SET assigned_id=?, state=?, updated_at=datetime("now") WHERE id=?', [toAgent.id, 'pending', req.params.id]);
+    if (task.group_id) {
+      await db.run(`INSERT INTO agent_activity (id,group_id,actor_id,action,target_type,target_id,metadata) VALUES (?,?,?,?,?,?,?)`,
+        [uuidv4(), task.group_id, toAgent.id, 'TASK_HANDOFF', 'task', req.params.id, JSON.stringify({ note: note||'', previousAssigned: task.assigned_id })]);
+    }
+    broadcast({ type: 'task_handoff', taskId: req.params.id, from: task.assigned_id, to: toAgent.id, note });
+    res.json({ success: true, taskId: req.params.id, handedTo: toAgent.name });
+  } catch (e) { res.status(e.statusCode||500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// v4.0: SCHEDULED MESSAGES
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Schedule message ─────────────────────────────────────────
+app.post('/api/messages/scheduled', requireApiKey, async (req, res) => {
+  try {
+    const { from, to, toGroup, content, intent, priority, sendAt } = req.body;
+    if (!from || !content || !sendAt) return res.status(400).json({ error: 'from, content, sendAt required' });
+    const fromAgent = await requireAgent(from, 'agent');
+    const id = uuidv4();
+    await db.run(`INSERT INTO scheduled_messages (id,from_agent,to_agent,to_group,content,intent,priority,scheduled_at) VALUES (?,?,?,?,?,?,?,?)`,
+      [id, fromAgent.id, to||null, toGroup||null, content, intent||'direct', priority||0, sendAt]);
+    res.json({ success: true, id, scheduledAt: sendAt });
+  } catch (e) { res.status(e.statusCode||500).json({ error: e.message }); }
+});
+
+// ─── List scheduled ───────────────────────────────────────────
+app.get('/api/messages/scheduled', requireApiKey, async (req, res) => {
+  try {
+    const rows = await db.all('SELECT * FROM scheduled_messages WHERE status=? ORDER BY scheduled_at ASC LIMIT 100', ['pending']);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Cancel scheduled ─────────────────────────────────────────
+app.delete('/api/messages/scheduled/:id', requireApiKey, async (req, res) => {
+  try {
+    await db.run('UPDATE scheduled_messages SET status=? WHERE id=? AND status=?', ['cancelled', req.params.id, 'pending']);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// v4.0: CAPABILITY DIRECTORY + DECISIONS
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Capability directory ──────────────────────────────────────
+app.get('/api/capabilities', requireApiKey, async (req, res) => {
+  try {
+    const rows = await db.all('SELECT ap.*, a.name FROM agent_presence ap JOIN agents a ON ap.agent_id=a.id');
+    const directory = {};
+    rows.forEach(r => {
+      JSON.parse(r.capabilities||'[]').forEach(c => {
+        if (!directory[c]) directory[c] = [];
+        directory[c].push({ agentId: r.agent_id, name: r.name, state: r.state, bandwidthUpload: r.bandwidth_upload });
+      });
+    });
+    res.json({ directory, totalAgents: rows.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Log decision ──────────────────────────────────────────────
+app.post('/api/decisions', requireApiKey, async (req, res) => {
+  try {
+    const { groupId, content, context, decidedBy } = req.body;
+    if (!content) return res.status(400).json({ error: 'content required' });
+    const id = uuidv4();
+    if (groupId) {
+      await db.run(`INSERT INTO agent_activity (id,group_id,actor_id,action,target_type,target_id,metadata) VALUES (?,?,?,?,?,?,?)`,
+        [uuidv4(), groupId, decidedBy||null, 'DECISION', 'decision', id, JSON.stringify({ content, context: context||'' })]);
+    }
+    res.json({ success: true, id, decision: content });
+  } catch (e) { res.status(e.statusCode||500).json({ error: e.message }); }
+});
+
+// ─── Get decisions ─────────────────────────────────────────────
+app.get('/api/decisions', requireApiKey, async (req, res) => {
+  try {
+    const { groupId, limit=20 } = req.query;
+    let sql = `SELECT * FROM agent_activity WHERE action='DECISION'`;
+    const params = [];
+    if (groupId) { sql += ' AND group_id=?'; params.push(groupId); }
+    sql += ' ORDER BY created_at DESC LIMIT ?';
+    params.push(Number(limit));
+    const rows = await db.all(sql, params);
+    res.json(rows.map(r=>({...r, metadata: JSON.parse(r.metadata||'{}')})));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// v4.0: GROUP INVITATIONS
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Request to join ────────────────────────────────────────────
+app.post('/api/groups/:groupId/request', requireApiKey, async (req, res) => {
+  try {
+    const group = await requireGroup(req.params.groupId, 'group');
+    const { agentId } = req.body;
+    const agent = agentId ? await resolveAgent(agentId) : null;
+    const id = uuidv4();
+    await db.run(`INSERT OR IGNORE INTO agent_group_invitations (id,group_id,agent_id,status) VALUES (?,?,?,?)`,
+      [id, group.id, agent?.id||agentId, 'pending']);
+    broadcast({ type: 'group_join_request', groupId: group.id, groupName: group.name, agentId: agent?.id||agentId, agentName: agent?.name||agentId });
+    res.json({ success: true, id, status: 'pending' });
+  } catch (e) { res.status(e.statusCode||500).json({ error: e.message }); }
+});
+
+// ─── Approve/reject invitation ───────────────────────────────
+app.patch('/api/groups/:groupId/request/:agentId', requireApiKey, async (req, res) => {
+  try {
+    const group = await requireGroup(req.params.groupId, 'group');
+    const agent = await requireAgent(req.params.agentId, 'agent');
+    const { status } = req.body;
+    if (!['approved','rejected'].includes(status)) return res.status(400).json({ error: 'status must be approved or rejected' });
+    await db.run('UPDATE agent_group_invitations SET status=?, responded_at=datetime("now") WHERE group_id=? AND agent_id=?',
+      [status, group.id, agent.id]);
+    if (status === 'approved') {
+      await db.run('INSERT OR IGNORE INTO agent_group_members (group_id,agent_id,role) VALUES (?,?,?)', [group.id, agent.id, 'member']);
+      broadcast({ type: 'group_member_joined', groupId: group.id, agentId: agent.id, agentName: agent.name });
+    }
+    broadcast({ type: 'group_invite_response', groupId: group.id, agentId: agent.id, status });
+    res.json({ success: true, status });
+  } catch (e) { res.status(e.statusCode||500).json({ error: e.message }); }
+});
+
+// ─── List pending invitations ──────────────────────────────────
+app.get('/api/groups/:groupId/requests', requireApiKey, async (req, res) => {
+  try {
+    const group = await requireGroup(req.params.groupId, 'group');
+    const rows = await db.all(
+      `SELECT ri.*, a.name as agent_name FROM agent_group_invitations ri JOIN agents a ON ri.agent_id=a.id WHERE ri.group_id=? AND ri.status='pending'`,
+      [group.id]);
+    res.json(rows);
+  } catch (e) { res.status(e.statusCode||500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// v4.0: META-AGENT ORCHESTRATION
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Meta-agent orchestrate ────────────────────────────────────
+app.post('/api/mesh/orchestrate', requireApiKey, async (req, res) => {
+  try {
+    const { action, payload, agentId } = req.body;
+    switch (action) {
+      case 'summarize_group': {
+        const { groupId } = payload || {};
+        if (!groupId) return res.status(400).json({ error: 'groupId required' });
+        const msgs = await db.all(
+          `SELECT m.content, m.created_at FROM messages m WHERE m.to_group=? ORDER BY m.created_at DESC LIMIT 50`,
+          [groupId]);
+        const summary = msgs.length ? `Last ${msgs.length} messages in group ${groupId}: ` + msgs.map(m=>m.content).join(' | ').slice(0,1000) : 'No recent messages';
+        res.json({ success: true, action, summary, messageCount: msgs.length });
+        break;
+      }
+      case 'route_task': {
+        const { task, requires } = payload || {};
+        const caps = requires ? requires.split(',').map(s=>s.trim()) : [];
+        const routed = await db.all(
+          `SELECT ap.agent_id, a.name, ap.state, ap.capabilities FROM agent_presence ap JOIN agents a ON ap.agent_id=a.id WHERE ap.state NOT IN ('offline','away') LIMIT 5`);
+        const scored = routed.map(r => ({ ...r, capabilities: JSON.parse(r.capabilities||'[]') }))
+          .map(r => ({ ...r, score: caps.filter(c=>r.capabilities.includes(c)).length + (r.state==='online'?5:0) }))
+          .sort((a,b) => b.score - a.score);
+        res.json({ success: true, action, candidates: scored.slice(0,3), totalCandidates: scored.length });
+        break;
+      }
+      case 'mesh_status': {
+        const agents = await db.get('SELECT COUNT(*) as c FROM agents');
+        const groups = await db.get('SELECT COUNT(*) as c FROM agent_groups');
+        const tasks = await db.all('SELECT state, COUNT(*) as c FROM agent_tasks GROUP BY state');
+        const presence = await db.all('SELECT state, COUNT(*) as c FROM agent_presence GROUP BY state');
+        res.json({ success: true, action, stats: { agents: agents.c, groups: groups.c, tasks, presence } });
+        break;
+      }
+      default:
+        res.status(400).json({ error: `Unknown action: ${action}. Valid: summarize_group, route_task, mesh_status` });
+    }
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // Basic health check
 app.get('/health', (req, res) => {
