@@ -190,7 +190,7 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS messages (
       id TEXT PRIMARY KEY,
       from_agent TEXT NOT NULL,
-      to_agent TEXT NOT NULL,
+      to_agent TEXT,
       content TEXT NOT NULL,
       message_type TEXT DEFAULT 'direct',
       read BOOLEAN DEFAULT 0,
@@ -327,8 +327,12 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_agent_health_status ON agent_health_status(status, last_updated DESC);
   `);
 
+  // v4.0: Add thread_id and intent columns if messages table already exists
+  try { await db.exec(`ALTER TABLE messages ADD COLUMN thread_id TEXT`); } catch (e) { /* ignore if exists */ }
+  try { await db.exec(`ALTER TABLE messages ADD COLUMN intent TEXT`); } catch (e) { /* ignore if exists */ }
 
-    // ---- v4.0: Presence & Capabilities ------
+
+  // ---- v4.0: Presence & Capabilities ------
     await db.exec(`
       CREATE TABLE IF NOT EXISTS agent_presence (
         agent_id TEXT PRIMARY KEY,
