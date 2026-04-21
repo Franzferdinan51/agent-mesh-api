@@ -14,6 +14,7 @@ import http from 'http';
 import { existsSync, readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { phantomSeed, phantomDownload, phantomIdentity, phantomStatus, phantomInfo, phantomSeedAll } from './phantom-bridge.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -2338,6 +2339,81 @@ app.get('/api/openclaw/compat', requireApiKey, (req, res) => {
   });
 });
 
+
+// === PHANTOM / RETICULUM BRIDGE ===
+
+// Seed a file on Reticulum mesh
+app.post('/api/phantom/seed', requireApiKey, async (req, res) => {
+  try {
+    const { filepath } = req.body;
+    if (!filepath) return res.status(400).json({ error: 'filepath is required' });
+    
+    const result = await phantomSeed(filepath);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Download a file from Reticulum mesh
+app.post('/api/phantom/download', requireApiKey, async (req, res) => {
+  try {
+    const { ghostFile, outputDir } = req.body;
+    if (!ghostFile) return res.status(400).json({ error: 'ghostFile is required' });
+    
+    const result = await phantomDownload(ghostFile, outputDir);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get Phantom node identity
+app.get('/api/phantom/identity', requireApiKey, async (req, res) => {
+  try {
+    const result = await phantomIdentity();
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get Phantom/Reticulum status
+app.get('/api/phantom/status', requireApiKey, async (req, res) => {
+  try {
+    const result = await phantomStatus();
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Seed all files in a directory
+app.post('/api/phantom/seed-all', requireApiKey, async (req, res) => {
+  try {
+    const { dirPath } = req.body;
+    if (!dirPath) return res.status(400).json({ error: 'dirPath is required' });
+    
+    const result = await phantomSeedAll(dirPath);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get ghost file info
+app.get('/api/phantom/info', requireApiKey, async (req, res) => {
+  try {
+    const { ghostFile } = req.query;
+    if (!ghostFile) return res.status(400).json({ error: 'ghostFile query param is required' });
+    
+    const result = await phantomInfo(ghostFile);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // === WEBSOCKET ===
 
 const server = http.createServer(app);
@@ -2442,6 +2518,14 @@ async function start() {
 ║    POST /api/skills            - Register skill          ║
 ║    GET  /api/skills            - Discover skills         ║
 ║    POST /api/skills/:id/invoke - Invoke skill            ║
+╠══════════════════════════════════════════════════════════╣
+║  Reticulum Phantom (optional - requires rns):          ║
+║    POST /api/phantom/seed         - Seed file on mesh   ║
+║    POST /api/phantom/download   - Download via mesh   ║
+║    GET  /api/phantom/status     - Reticulum status     ║
+║    GET  /api/phantom/identity  - Node identity        ║
+║    POST /api/phantom/seed-all  - Seed directory       ║
+║    GET  /api/phantom/info      - Ghost file metadata  ║
 ╚══════════════════════════════════════════════════════════╝
     `);
   });

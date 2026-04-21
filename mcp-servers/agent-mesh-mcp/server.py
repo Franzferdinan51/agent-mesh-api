@@ -29,7 +29,10 @@ def format_agent(agent: dict) -> str:
 async def get_client():
     return httpx.AsyncClient(
         base_url=MESH_URL,
-        headers={"X-API-Key": API_KEY},
+        headers={
+            "X-API-Key": API_KEY,
+            "Authorization": f"Bearer {API_KEY}",
+        },
         timeout=20.0,
     )
 
@@ -151,6 +154,193 @@ async def get_agent_status(limit: int = 50) -> str:
             return "📊 Agent Status\n\n" + "\n\n".join(format_agent(a) for a in agents)
         except Exception as e:
             return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def mesh_group_create(name: str, description: str = "") -> str:
+    """Create a new agent group on the mesh."""
+    async with await get_client() as client:
+        try:
+            resp = await client.post("/api/groups", json={"name": name, "description": description})
+            resp.raise_for_status()
+            data = resp.json()
+            return f"Group created: {name} (id: {data.get('id', 'n/a')})"
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def mesh_group_broadcast(group_id_or_name: str, message: str) -> str:
+    """Broadcast a message to all members of a group."""
+    async with await get_client() as client:
+        try:
+            sender_id = await ensure_sender(client)
+            resp = await client.post(f"/api/groups/{group_id_or_name}/broadcast", 
+                json={"from": sender_id, "content": message})
+            resp.raise_for_status()
+            data = resp.json()
+            return f"Broadcast sent to group {group_id_or_name} ({data.get('recipientCount', 0)} members)"
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def mesh_list_groups() -> str:
+    """List all agent groups on the mesh."""
+    async with await get_client() as client:
+        try:
+            resp = await client.get("/api/groups")
+            resp.raise_for_status()
+            groups = resp.json()
+            if not groups:
+                return "No groups created yet."
+            lines = [f"Groups ({len(groups)}):"]
+            for g in groups:
+                lines.append(f"  • {g.get('name', '?')} [{g.get('id', '?')}]")
+                if g.get('description'):
+                    lines.append(f"    {g['description']}")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def mesh_memory_store(group_id_or_name: str, key: str, value: str) -> str:
+    """Store a key-value pair in a group's collective memory."""
+    async with await get_client() as client:
+        try:
+            resp = await client.post(f"/api/groups/{group_id_or_name}/memory",
+                json={"key": key, "value": value})
+            resp.raise_for_status()
+            data = resp.json()
+            return f"Stored '{key}' in group {group_id_or_name} (version {data.get('version', '?')})"
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def mesh_memory_get(group_id_or_name: str, key: str = "") -> str:
+    """Get values from a group's collective memory. Omit key to get all."""
+    async with await get_client() as client:
+        try:
+            if key:
+                resp = await client.get(f"/api/groups/{group_id_or_name}/memory/{key}")
+            else:
+                resp = await client.get(f"/api/groups/{group_id_or_name}/memory")
+            resp.raise_for_status()
+            data = resp.json()
+            return f"Memory for group {group_id_or_name}:\n{str(data)}"
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def mesh_bulk_register(agents_json: str) -> str:
+    """Bulk-register up to 50 agents. Pass JSON array: '[{"name":"A","capabilities":["x"]}]'."""
+    async with await get_client() as client:
+        try:
+            import json
+            agents = json.loads(agents_json)
+            resp = await client.post("/api/agents/bulk-register", json={"agents": agents})
+            resp.raise_for_status()
+            data = resp.json()
+            return f"Bulk registered: {len(data)} agents processed"
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def mesh_batch_send(messages_json: str) -> str:
+    """Batch-send up to 100 messages. Pass JSON array with {from,to,message} objects."""
+    async with await get_client() as client:
+        try:
+            import json
+            messages = json.loads(messages_json)
+            resp = await client.post("/api/messages/batch", json={"messages": messages})
+            resp.raise_for_status()
+            data = resp.json()
+            return f"Batch sent: {len(data)} results"
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def mesh_stats() -> str:
+    """Get mesh server statistics."""
+    async with await get_client() as client:
+        try:
+            resp = await client.get("/api/stats")
+            resp.raise_for_status()
+            s = resp.json()
+            counts = s.get("counts", {})
+            return (
+                f"Mesh Stats v{s.get('version', '?')}\n"
+                f"  Uptime: {s.get('uptimeSeconds', 0)}s\n"
+                f"  Agents: {counts.get('agents', 0)}\n"
+                f"  Messages: {counts.get('messages', 0)}\n"
+                f"  Groups: {counts.get('groups', 0)}\n"
+                f"  Files: {counts.get('files', 0)}\n"
+                f"  Active Catastrophes: {counts.get('activeCatastrophes', 0)}"
+            )
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def mesh_ping(agent_name_or_id: str) -> str:
+    """Ping an agent to check if it's alive."""
+    async with await get_client() as client:
+        try:
+            resp = await client.post(f"/api/agents/ping/{agent_name_or_id}")
+            resp.raise_for_status()
+            return f"Ping to {agent_name_or_id}: OK"
+        except Exception as e:
+            return f"Ping failed: {str(e)}"
+
+
+@mcp.tool()
+async def phantom_status() -> str:
+    """Check Reticulum Phantom status and mesh connectivity."""
+    try:
+        import subprocess, json
+        venv_python = "/tmp/rns-venv/bin/python"
+        phantom_py = f"{os.path.expanduser('~')}/Desktop/AgentTeam-GitHub/reticulum-phantom/phantom.py"
+        
+        proc = subprocess.run(
+            [venv_python, phantom_py, "identity"],
+            capture_output=True, text=True, timeout=10,
+            env={**os.environ, "PYTHONPATH": "/tmp/rns-venv/lib/python3.14/site-packages"}
+        )
+        output = proc.stdout + proc.stderr
+        connected = "destination" in output.lower() or "hash" in output.lower()
+        return f"Reticulum Phantom: {'CONNECTED' if connected else 'NOT CONNECTED'}\n{output[:300]}"
+    except Exception as e:
+        return f"Phantom error: {str(e)}"
+
+
+@mcp.tool()
+async def phantom_seed(filepath: str) -> str:
+    """Seed a file on the Reticulum mesh. Creates .ghost and starts sharing."""
+    try:
+        import subprocess
+        venv_python = "/tmp/rns-venv/bin/python"
+        phantom_py = f"{os.path.expanduser('~')}/Desktop/AgentTeam-GitHub/reticulum-phantom/phantom.py"
+        
+        # create first
+        subprocess.run([venv_python, phantom_py, "create", filepath],
+            capture_output=True, timeout=30,
+            env={**os.environ, "PYTHONPATH": "/tmp/rns-venv/lib/python3.14/site-packages"})
+        
+        # then seed
+        proc = subprocess.run([venv_python, phantom_py, "seed", filepath],
+            capture_output=True, text=True, timeout=30,
+            env={**os.environ, "PYTHONPATH": "/tmp/rns-venv/lib/python3.14/site-packages"})
+        
+        ghost_path = filepath + ".ghost"
+        return f"Seeding {filepath}\nGhost: {ghost_path}\n{proc.stdout[:200]}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
 
 
 if __name__ == "__main__":

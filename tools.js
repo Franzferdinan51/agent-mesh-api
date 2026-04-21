@@ -33,9 +33,10 @@ const api = axios.create({
   baseURL: MESH_URL,
   headers: {
     'X-API-Key': API_KEY,
+    'Authorization': `Bearer ${API_KEY}`,
     'Content-Type': 'application/json'
   },
-  timeout: 10000
+  timeout: 30000
 });
 
 // Tool implementations
@@ -315,6 +316,192 @@ export const tools = {
       };
     }
   }
+
+  // ── v3.0.0 / v3.1.0 NEW TOOLS ──────────────────────────────────────
+
+  /**
+   * Create an agent group
+   */
+  async mesh_group_create(params) {
+    const name = params.name;
+    const description = params.description || '';
+    if (!name) return { error: 'name is required' };
+    try {
+      const response = await api.post('/api/groups', { name, description });
+      return { success: true, groupId: response.data.id, name };
+    } catch (error) {
+      return { success: false, error: error.response?.data?.error || error.message };
+    }
+  },
+
+  /**
+   * Add a member to a group
+   */
+  async mesh_group_add_member(params) {
+    const groupId = params.groupId || params.name;
+    const agentId = params.agentId;
+    if (!groupId || !agentId) return { error: 'groupId and agentId are required' };
+    try {
+      await api.post(`/api/groups/${groupId}/members`, { agentId });
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error.response?.data?.error || error.message };
+    }
+  },
+
+  /**
+   * Broadcast to a group
+   */
+  async mesh_group_broadcast(params) {
+    const groupId = params.groupId || params.name;
+    const from = agentId || params.from;
+    const content = params.content;
+    if (!groupId || !from || !content) return { error: 'groupId, from, and content are required' };
+    try {
+      const response = await api.post(`/api/groups/${groupId}/broadcast`, { from, content });
+      return { success: true, recipientCount: response.data.recipientCount };
+    } catch (error) {
+      return { success: false, error: error.response?.data?.error || error.message };
+    }
+  },
+
+  /**
+   * Get group details
+   */
+  async mesh_group_info(params) {
+    const groupId = params.groupId || params.name;
+    if (!groupId) return { error: 'groupId is required' };
+    try {
+      const response = await api.get(`/api/groups/${groupId}`);
+      return { success: true, group: response.data };
+    } catch (error) {
+      return { success: false, error: error.response?.data?.error || error.message };
+    }
+  },
+
+  /**
+   * List all groups
+   */
+  async mesh_list_groups() {
+    try {
+      const response = await api.get('/api/groups');
+      return { success: true, groups: response.data, count: response.data.length };
+    } catch (error) {
+      return { success: false, error: error.response?.data?.error || error.message };
+    }
+  },
+
+  /**
+   * Store collective memory in a group
+   */
+  async mesh_memory_store(params) {
+    const groupId = params.groupId || params.name;
+    const key = params.key;
+    const value = params.value;
+    if (!groupId || !key || value === undefined) return { error: 'groupId, key, and value are required' };
+    try {
+      const response = await api.post(`/api/groups/${groupId}/memory`, { key, value });
+      return { success: true, version: response.data.version };
+    } catch (error) {
+      return { success: false, error: error.response?.data?.error || error.message };
+    }
+  },
+
+  /**
+   * Get collective memory from a group
+   */
+  async mesh_memory_get(params) {
+    const groupId = params.groupId || params.name;
+    const key = params.key;
+    if (!groupId) return { error: 'groupId is required' };
+    try {
+      const url = key ? `/api/groups/${groupId}/memory/${key}` : `/api/groups/${groupId}/memory`;
+      const response = await api.get(url);
+      return { success: true, data: response.data };
+    } catch (error) {
+      return { success: false, error: error.response?.data?.error || error.message };
+    }
+  },
+
+  /**
+   * Bulk register agents (v3.1.0)
+   */
+  async mesh_bulk_register(params) {
+    const agents = params.agents;
+    if (!agents || !Array.isArray(agents)) return { error: 'agents array is required' };
+    try {
+      const response = await api.post('/api/agents/bulk-register', { agents });
+      return { success: true, results: response.data };
+    } catch (error) {
+      return { success: false, error: error.response?.data?.error || error.message };
+    }
+  },
+
+  /**
+   * Batch send messages (v3.1.0)
+   */
+  async mesh_batch_send(params) {
+    const messages = params.messages;
+    if (!messages || !Array.isArray(messages)) return { error: 'messages array is required' };
+    try {
+      const response = await api.post('/api/messages/batch', { messages });
+      return { success: true, results: response.data };
+    } catch (error) {
+      return { success: false, error: error.response?.data?.error || error.message };
+    }
+  },
+
+  /**
+   * Get mesh health dashboard (v3.1.0)
+   */
+  async mesh_health_dashboard() {
+    try {
+      const response = await api.get('/api/health');
+      return { success: true, health: response.data };
+    } catch (error) {
+      return { success: false, error: error.response?.data?.error || error.message };
+    }
+  },
+
+  /**
+   * Get mesh stats (v3.1.0)
+   */
+  async mesh_stats() {
+    try {
+      const response = await api.get('/api/stats');
+      return { success: true, stats: response.data };
+    } catch (error) {
+      return { success: false, error: error.response?.data?.error || error.message };
+    }
+  },
+
+  /**
+   * Ping an agent (v3.1.0)
+   */
+  async mesh_ping(params) {
+    const agentIdOrName = params.agentId || params.name;
+    if (!agentIdOrName) return { error: 'agentId or name is required' };
+    try {
+      const response = await api.post(`/api/agents/ping/${agentIdOrName}`);
+      return { success: true, result: response.data };
+    } catch (error) {
+      return { success: false, error: error.response?.data?.error || error.message };
+    }
+  },
+
+  /**
+   * Get capability index (v3.1.0)
+   */
+  async mesh_capabilities() {
+    try {
+      const response = await api.get('/api/capabilities');
+      return { success: true, capabilities: response.data };
+    } catch (error) {
+      return { success: false, error: error.response?.data?.error || error.message };
+    }
+  },
+
+
 };
 
 // Load saved agent ID on startup
