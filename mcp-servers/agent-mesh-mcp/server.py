@@ -34,6 +34,9 @@ async def get_client():
             "Authorization": f"Bearer {API_KEY}",
         },
         timeout=20.0,
+        # The mesh is a local/LAN service: never route through HTTP(S)_PROXY
+        # env vars (a malformed no_proxy entry otherwise breaks every call).
+        trust_env=False,
     )
 
 
@@ -298,14 +301,31 @@ async def mesh_ping(agent_name_or_id: str) -> str:
             return f"Ping failed: {str(e)}"
 
 
+def phantom_unavailable():
+    """Return a clear message if the Phantom/rns stack is not installed, else None."""
+    venv_python = os.environ.get("PHANTOM_PYTHON", "/tmp/rns-venv/bin/python")
+    phantom_py = os.environ.get(
+        "PHANTOM_PATH",
+        f"{os.path.expanduser('~')}/Desktop/AgentTeam-GitHub/reticulum-phantom/phantom.py",
+    )
+    if not os.path.exists(phantom_py):
+        return f"Phantom not available: phantom.py not found at {phantom_py} (install the Reticulum/rns stack to enable Phantom)"
+    if not os.path.exists(venv_python):
+        return f"Phantom not available: rns venv python not found at {venv_python} (install the Reticulum/rns stack to enable Phantom)"
+    return None
+
+
 @mcp.tool()
 async def phantom_status() -> str:
     """Check Reticulum Phantom status and mesh connectivity."""
+    unavailable = phantom_unavailable()
+    if unavailable:
+        return unavailable
     try:
         import subprocess, json
         venv_python = "/tmp/rns-venv/bin/python"
         phantom_py = f"{os.path.expanduser('~')}/Desktop/AgentTeam-GitHub/reticulum-phantom/phantom.py"
-        
+
         proc = subprocess.run(
             [venv_python, phantom_py, "identity"],
             capture_output=True, text=True, timeout=10,
@@ -321,6 +341,9 @@ async def phantom_status() -> str:
 @mcp.tool()
 async def phantom_seed(filepath: str) -> str:
     """Seed a file on the Reticulum mesh. Creates .ghost and starts sharing."""
+    unavailable = phantom_unavailable()
+    if unavailable:
+        return unavailable
     try:
         import subprocess
         venv_python = "/tmp/rns-venv/bin/python"

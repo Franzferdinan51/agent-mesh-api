@@ -214,7 +214,7 @@ export default function App() {
           <div className="connection-form">
             <div className="form-group">
               <label>Mesh Base URL</label>
-              <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="http://100.74.88.40:4000" />
+              <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="http://localhost:4000" />
             </div>
             <div className="form-group">
               <label>API Key (X-API-Key)</label>
@@ -310,7 +310,7 @@ export default function App() {
                 <input
                   value={regEndpoint}
                   onChange={(e) => setRegEndpoint(e.target.value)}
-                  placeholder="Endpoint (e.g., http://100.106.80.61:18789)"
+                  placeholder="Endpoint (e.g., http://localhost:4000)"
                 />
                 <input
                   value={regCaps}

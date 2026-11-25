@@ -2,17 +2,37 @@
  * Simple Mesh API Client
  * Lightweight REST client for agent-mesh-api v4.0
  */
-export function createClient({ baseURL = 'http://localhost:4000', apiKey = 'openclaw-mesh-default-key' } = {}) {
+export function createClient({ baseURL = process.env.AGENT_MESH_URL || 'http://localhost:4000', apiKey = process.env.AGENT_MESH_API_KEY || 'openclaw-mesh-default-key' } = {}) {
   const headers = {
     'Content-Type': 'application/json',
     'X-API-Key': apiKey,
     'Authorization': `Bearer ${apiKey}`,
   };
 
+  function toQueryString(params) {
+    if (!params) return '';
+    const qs = new URLSearchParams();
+    for (const [key, value] of Object.entries(params)) {
+      if (value === undefined || value === null) continue;
+      if (Array.isArray(value)) {
+        value.forEach(v => { if (v !== undefined && v !== null) qs.append(key, String(v)); });
+      } else {
+        qs.append(key, String(value));
+      }
+    }
+    const s = qs.toString();
+    return s ? `?${s}` : '';
+  }
+
   async function request(method, path, body) {
-    const url = `${baseURL}${path}`;
+    let url = `${baseURL}${path}`;
     const opts = { method, headers };
-    if (body) opts.body = JSON.stringify(body);
+    if (method === 'GET' || method === 'HEAD') {
+      // GET/HEAD requests cannot have a body — serialize params into the query string instead.
+      url += toQueryString(body);
+    } else if (body) {
+      opts.body = JSON.stringify(body);
+    }
     const res = await fetch(url, opts);
     const data = await res.json();
     if (!res.ok) throw Object.assign(new Error(data.error || 'request failed'), { status: res.status, data });
@@ -22,7 +42,7 @@ export function createClient({ baseURL = 'http://localhost:4000', apiKey = 'open
   return {
     // Agents
     async registerAgent(data) { return request('POST', '/api/agents/register', data); },
-    async getAgents(params) { return request('GET', '/api/agents'); },
+    async getAgents(params) { return request('GET', '/api/agents', params); },
     async getAgent(id) { return request('GET', `/api/agents/${id}`); },
     async getAgentPresence(id) { return request('GET', `/api/agents/${id}/presence`); },
     async updatePresence(id, data) { return request('PATCH', `/api/agents/${id}/presence`, data); },

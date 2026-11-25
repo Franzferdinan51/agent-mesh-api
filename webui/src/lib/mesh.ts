@@ -27,7 +27,7 @@ export type Skill = {
 };
 
 function getBaseUrl() {
-  return localStorage.getItem('mesh.baseUrl') || 'http://100.74.88.40:4000';
+  return localStorage.getItem('mesh.baseUrl') || 'http://localhost:4000';
 }
 
 function getApiKey() {

@@ -23,9 +23,25 @@ const PHANTOM_IDENTITY_FILE = process.env.PHANTOM_IDENTITY ||
   path.join(process.env.HOME || '', '.reticulum', 'identities', 'default');
 
 /**
+ * Whether the Phantom CLI (and its rns stack) is present on this machine.
+ * Phantom is optional: when it's absent, every bridge call must degrade
+ * to a clear { success: false } result instead of spawning a missing file.
+ */
+export function phantomAvailable() {
+  return fs.existsSync(PHANTOM_PATH);
+}
+
+export const PHANTOM_UNAVAILABLE_MSG =
+  `Phantom not available: phantom.py not found at ${PHANTOM_PATH} ` +
+  `(install the Reticulum/rns stack and set PHANTOM_PATH to enable Phantom)`;
+
+/**
  * Run a phantom command and return structured result
  */
 export async function runPhantom(args, timeoutMs = 30000) {
+  if (!phantomAvailable()) {
+    return { success: false, stdout: '', stderr: PHANTOM_UNAVAILABLE_MSG, exitCode: -1, unavailable: true };
+  }
   return new Promise((resolve) => {
     // Check if phantom python exists, fallback to system python3
     const python = fs.existsSync(PHANTOM_PYTHON) ? PHANTOM_PYTHON : 'python3';
@@ -169,22 +185,34 @@ export async function phantomIdentity() {
  * Get Phantom/Reticulum status
  */
 export async function phantomStatus() {
+  if (!phantomAvailable()) {
+    return {
+      success: false,
+      available: false,
+      reticulumeConnected: false,
+      probeOutput: '',
+      identityOutput: '',
+      note: PHANTOM_UNAVAILABLE_MSG
+    };
+  }
+
   // Try probe first (lightweight)
   const probeResult = await runPhantom(['probe'], 10000);
-  
+
   // Try identity to see if Reticulum is configured
   const idResult = await runPhantom(['identity'], 5000);
-  
-  const isConnected = idResult.success && 
+
+  const isConnected = idResult.success &&
     (idResult.stdout.includes('destination') || idResult.stdout.includes('hash'));
 
   return {
     success: true,
+    available: true,
     reticulumeConnected: isConnected,
     probeOutput: probeResult.stdout.substring(0, 500),
     identityOutput: idResult.stdout.substring(0, 300),
-    note: isConnected 
-      ? 'Reticulum mesh is connected' 
+    note: isConnected
+      ? 'Reticulum mesh is connected'
       : 'Reticulum not connected — run "phantom probe" to test connectivity'
   };
 }

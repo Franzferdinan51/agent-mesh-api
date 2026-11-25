@@ -28,6 +28,7 @@ const BODY_LIMIT = process.env.AGENT_MESH_BODY_LIMIT || '12mb';
 const OFFLINE_THRESHOLD_MINUTES = parseInt(process.env.AGENT_MESH_OFFLINE_MINUTES || '5', 10);
 const DEFAULT_MESSAGE_TIMEOUT_MS = parseInt(process.env.MESSAGE_TIMEOUT || '300000', 10);
 const MESSAGE_TIMEOUT_CHECK_INTERVAL_MS = parseInt(process.env.MESSAGE_TIMEOUT_CHECK_INTERVAL_MS || '60000', 10);
+const SCHEDULED_MESSAGE_CHECK_INTERVAL_MS = parseInt(process.env.SCHEDULED_MESSAGE_CHECK_INTERVAL_MS || '15000', 10);
 const SERVER_STARTED_AT = Date.now();
 const VALID_MESSAGE_STATUSES = ['pending', 'delivered', 'processing', 'completed', 'failed', 'timeout'];
 const VALID_HEALTH_STATUSES = ['healthy', 'degraded', 'unhealthy', 'offline'];
@@ -272,6 +273,8 @@ async function initDb() {
       required_version TEXT,
       breaking_change BOOLEAN DEFAULT 0,
       announcement TEXT,
+      payload_url TEXT,
+      sha256 TEXT,
       created_by TEXT NOT NULL,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       expires_at DATETIME
@@ -330,6 +333,10 @@ async function initDb() {
   // v4.0: Add thread_id and intent columns if messages table already exists
   try { await db.exec(`ALTER TABLE messages ADD COLUMN thread_id TEXT`); } catch (e) { /* ignore if exists */ }
   try { await db.exec(`ALTER TABLE messages ADD COLUMN intent TEXT`); } catch (e) { /* ignore if exists */ }
+
+  // v4.1: Add payload_url and sha256 columns if system_updates table already exists
+  try { await db.exec(`ALTER TABLE system_updates ADD COLUMN payload_url TEXT`); } catch (e) { /* ignore if exists */ }
+  try { await db.exec(`ALTER TABLE system_updates ADD COLUMN sha256 TEXT`); } catch (e) { /* ignore if exists */ }
 
 
   // ---- v4.0: Presence & Capabilities ------
@@ -829,7 +836,10 @@ app.post('/api/agents/ping/:id', requireApiKey, async (req, res) => {
 
 // === CAPABILITY DISCOVERY ===
 
-// Get aggregated capability index — useful for multi-agent routing (e.g. Agent-Teams hive-router)
+// Canonical capability directory: agents grouped by capability, including each
+// agent's presence state. Merged from the former presence-based index and the
+// v4.0 presence directory (duplicate route removed in v4.1) — useful for
+// multi-agent routing (e.g. Agent-Teams hive-router).
 app.get('/api/capabilities', requireApiKey, async (req, res) => {
   try {
     const { agentId } = req.query;
@@ -842,20 +852,39 @@ app.get('/api/capabilities', requireApiKey, async (req, res) => {
       agents = await db.all('SELECT id, name, capabilities FROM agents');
     }
 
-    const index = {};
+    // Presence state per agent (agents without a presence row count as offline)
+    const presenceRows = await db.all('SELECT * FROM agent_presence');
+    const presenceByAgent = {};
+    for (const row of presenceRows) presenceByAgent[row.agent_id] = row;
+
+    const directory = {};
     for (const agent of agents) {
-      const caps = parseJson(agent.capabilities, []);
+      const presence = presenceByAgent[agent.id];
+      // Union of the agent's registered capabilities and its presence-reported ones
+      const caps = new Set([
+        ...parseJson(agent.capabilities, []),
+        ...parseJson(presence?.capabilities, [])
+      ]);
       for (const cap of caps) {
-        if (!index[cap]) index[cap] = [];
-        index[cap].push({ id: agent.id, name: agent.name });
+        if (!directory[cap]) directory[cap] = [];
+        directory[cap].push({
+          id: agent.id,
+          agentId: agent.id,
+          name: agent.name,
+          state: presence?.state || 'offline',
+          statusMessage: presence?.status_message || '',
+          bandwidthUpload: presence?.bandwidth_upload || 0,
+          bandwidthDownload: presence?.bandwidth_download || 0
+        });
       }
     }
 
     res.json({
-      totalCapabilities: Object.keys(index).length,
+      totalCapabilities: Object.keys(directory).length,
       totalAgents: agents.length,
-      index,
-      sorted: Object.keys(index).sort()
+      index: directory,
+      directory,
+      sorted: Object.keys(directory).sort()
     });
   } catch (error) {
     res.status(error.statusCode || 500).json({ error: error.message });
@@ -943,6 +972,39 @@ app.get('/api/messages/by-id/:id', requireApiKey, async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
+});
+
+// ─── Schedule message ─────────────────────────────────────────
+// NOTE: the /api/messages/scheduled routes must be registered before
+// GET /api/messages/:agentId below — Express matches in registration
+// order, so the param route would otherwise swallow "scheduled" as an
+// agent id and the list endpoint would 404 with "agent not found".
+app.post('/api/messages/scheduled', requireApiKey, async (req, res) => {
+  try {
+    const { from, to, toGroup, content, intent, priority, sendAt } = req.body;
+    if (!from || !content || !sendAt) return res.status(400).json({ error: 'from, content, sendAt required' });
+    const fromAgent = await requireAgent(from, 'agent');
+    const id = uuidv4();
+    await db.run(`INSERT INTO scheduled_messages (id,from_agent,to_agent,to_group,content,intent,priority,scheduled_at) VALUES (?,?,?,?,?,?,?,?)`,
+      [id, fromAgent.id, to||null, toGroup||null, content, intent||'direct', priority||0, sendAt]);
+    res.json({ success: true, id, scheduledAt: sendAt });
+  } catch (e) { res.status(e.statusCode||500).json({ error: e.message }); }
+});
+
+// ─── List scheduled ───────────────────────────────────────────
+app.get('/api/messages/scheduled', requireApiKey, async (req, res) => {
+  try {
+    const rows = await db.all('SELECT * FROM scheduled_messages WHERE status=? ORDER BY scheduled_at ASC LIMIT 100', ['pending']);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Cancel scheduled ─────────────────────────────────────────
+app.delete('/api/messages/scheduled/:id', requireApiKey, async (req, res) => {
+  try {
+    await db.run('UPDATE scheduled_messages SET status=? WHERE id=? AND status=?', ['cancelled', req.params.id, 'pending']);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // Get messages for agent
@@ -1892,7 +1954,8 @@ app.delete('/api/files/:id', requireApiKey, async (req, res) => {
 // Create system update
 app.post('/api/updates', requireApiKey, async (req, res) => {
   try {
-    const { version, updateType, title, description, requiredVersion, breakingChange, announcement } = req.body;
+    const { version, updateType, title, description, requiredVersion, breakingChange, announcement, sha256 } = req.body;
+    const payloadUrl = req.body.payloadUrl || req.body.payload_url || null;
 
     if (!version || !updateType || !title) {
       return res.status(400).json({ error: 'version, updateType, and title are required' });
@@ -1900,8 +1963,8 @@ app.post('/api/updates', requireApiKey, async (req, res) => {
 
     const id = uuidv4();
     await db.run(
-      'INSERT INTO system_updates (id, version, update_type, title, description, required_version, breaking_change, announcement, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [id, version, updateType, title, description || null, requiredVersion || null, breakingChange || false, announcement || null, 'DuckBot']
+      'INSERT INTO system_updates (id, version, update_type, title, description, required_version, breaking_change, announcement, payload_url, sha256, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [id, version, updateType, title, description || null, requiredVersion || null, breakingChange || false, announcement || null, payloadUrl, sha256 || null, 'DuckBot']
     );
 
     console.log(`[System Update] New update created: ${title} (${version})`);
@@ -1918,6 +1981,9 @@ app.post('/api/updates', requireApiKey, async (req, res) => {
         requiredVersion,
         breakingChange,
         announcement,
+        payloadUrl,
+        payload_url: payloadUrl,
+        sha256: sha256 || null,
         createdAt: new Date().toISOString()
       }
     });
@@ -2363,7 +2429,8 @@ app.get('/api/stats', requireApiKey, async (req, res) => {
       defaults: {
         offlineMinutes: OFFLINE_THRESHOLD_MINUTES,
         messageTimeoutMs: DEFAULT_MESSAGE_TIMEOUT_MS,
-        timeoutCheckIntervalMs: MESSAGE_TIMEOUT_CHECK_INTERVAL_MS
+        timeoutCheckIntervalMs: MESSAGE_TIMEOUT_CHECK_INTERVAL_MS,
+        scheduledMessageCheckIntervalMs: SCHEDULED_MESSAGE_CHECK_INTERVAL_MS
       },
       counts: {
         agents: agents.count,
@@ -2419,6 +2486,111 @@ async function checkMessageTimeouts() {
 
 // Run timeout check every minute
 setInterval(checkMessageTimeouts, MESSAGE_TIMEOUT_CHECK_INTERVAL_MS);
+
+// === SCHEDULED MESSAGE DELIVERY ===
+
+let scheduledDeliveryRunning = false;
+
+// Deliver one due scheduled message via the same paths as POST /api/messages
+// (direct) and POST /api/groups/:groupId/broadcast (group), broadcasting the
+// same WebSocket events a normal send does. Returns the recipient count.
+async function deliverScheduledMessage(row) {
+  const fromAgent = await db.get('SELECT * FROM agents WHERE id = ?', [row.from_agent]);
+  if (!fromAgent) throw new Error(`from agent not found: ${row.from_agent}`);
+  const messageType = row.intent || 'direct';
+
+  if (row.to_group) {
+    const group = await db.get(
+      'SELECT * FROM agent_groups WHERE id = ? OR name = ? LIMIT 1',
+      [row.to_group, row.to_group]
+    );
+    if (!group) throw new Error(`group not found: ${row.to_group}`);
+
+    const members = await db.all(
+      'SELECT agent_id FROM agent_group_members WHERE group_id = ? AND agent_id != ?',
+      [group.id, fromAgent.id]
+    );
+    if (members.length === 0) throw new Error(`group has no recipients: ${row.to_group}`);
+
+    for (const member of members) {
+      const id = uuidv4();
+      await db.run(
+        'INSERT INTO messages (id, from_agent, to_agent, content, message_type, status, timeout_ms) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [id, fromAgent.id, member.agent_id, row.content, messageType, 'delivered', DEFAULT_MESSAGE_TIMEOUT_MS]
+      );
+    }
+
+    broadcast({
+      type: 'group_broadcast',
+      groupId: group.id,
+      from: fromAgent.id,
+      fromName: fromAgent.name,
+      content: row.content,
+      recipientCount: members.length,
+      scheduledMessageId: row.id
+    });
+
+    return members.length;
+  }
+
+  const toAgent = await resolveAgent(row.to_agent);
+  if (!toAgent) throw new Error(`to agent not found: ${row.to_agent}`);
+
+  const id = uuidv4();
+  await db.run(
+    'INSERT INTO messages (id, from_agent, to_agent, content, message_type, timeout_ms) VALUES (?, ?, ?, ?, ?, ?)',
+    [id, fromAgent.id, toAgent.id, row.content, messageType, DEFAULT_MESSAGE_TIMEOUT_MS]
+  );
+
+  broadcast({
+    type: 'new_message',
+    message: {
+      id,
+      from: fromAgent.id,
+      fromName: fromAgent.name,
+      to: toAgent.id,
+      toName: toAgent.name,
+      content: row.content,
+      messageType,
+      timeoutMs: DEFAULT_MESSAGE_TIMEOUT_MS,
+      createdAt: new Date().toISOString(),
+      scheduledMessageId: row.id
+    }
+  });
+
+  return 1;
+}
+
+// Find due scheduled messages, deliver them, and mark each sent/failed
+async function processScheduledMessages() {
+  if (scheduledDeliveryRunning) return;
+  scheduledDeliveryRunning = true;
+  try {
+    const due = await db.all(
+      `SELECT * FROM scheduled_messages
+       WHERE status = 'pending' AND datetime(scheduled_at) <= datetime('now')
+       ORDER BY priority DESC, scheduled_at ASC LIMIT 100`
+    );
+
+    for (const row of due) {
+      try {
+        const recipients = await deliverScheduledMessage(row);
+        await db.run('UPDATE scheduled_messages SET status = ? WHERE id = ?', ['sent', row.id]);
+        console.log(`[Scheduled] Delivered scheduled message ${row.id} to ${recipients} recipient(s)`);
+      } catch (error) {
+        await db.run('UPDATE scheduled_messages SET status = ? WHERE id = ?', ['failed', row.id]);
+        console.error(`[Scheduled] Failed to deliver scheduled message ${row.id}:`, error.message);
+      }
+    }
+  } catch (error) {
+    console.error('[Error] Processing scheduled messages:', error);
+  } finally {
+    scheduledDeliveryRunning = false;
+  }
+}
+
+// Run scheduled delivery loop (interval configurable via SCHEDULED_MESSAGE_CHECK_INTERVAL_MS)
+setInterval(processScheduledMessages, SCHEDULED_MESSAGE_CHECK_INTERVAL_MS);
 
 // ═══════════════════════════════════════════════════════════════
 // v4.0: PRESENCE & CAPABILITY ROUTING
@@ -2715,54 +2887,18 @@ app.post('/api/tasks/:id/handoff', requireApiKey, async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 // v4.0: SCHEDULED MESSAGES
 // ═══════════════════════════════════════════════════════════════
-
-// ─── Schedule message ─────────────────────────────────────────
-app.post('/api/messages/scheduled', requireApiKey, async (req, res) => {
-  try {
-    const { from, to, toGroup, content, intent, priority, sendAt } = req.body;
-    if (!from || !content || !sendAt) return res.status(400).json({ error: 'from, content, sendAt required' });
-    const fromAgent = await requireAgent(from, 'agent');
-    const id = uuidv4();
-    await db.run(`INSERT INTO scheduled_messages (id,from_agent,to_agent,to_group,content,intent,priority,scheduled_at) VALUES (?,?,?,?,?,?,?,?)`,
-      [id, fromAgent.id, to||null, toGroup||null, content, intent||'direct', priority||0, sendAt]);
-    res.json({ success: true, id, scheduledAt: sendAt });
-  } catch (e) { res.status(e.statusCode||500).json({ error: e.message }); }
-});
-
-// ─── List scheduled ───────────────────────────────────────────
-app.get('/api/messages/scheduled', requireApiKey, async (req, res) => {
-  try {
-    const rows = await db.all('SELECT * FROM scheduled_messages WHERE status=? ORDER BY scheduled_at ASC LIMIT 100', ['pending']);
-    res.json(rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ─── Cancel scheduled ─────────────────────────────────────────
-app.delete('/api/messages/scheduled/:id', requireApiKey, async (req, res) => {
-  try {
-    await db.run('UPDATE scheduled_messages SET status=? WHERE id=? AND status=?', ['cancelled', req.params.id, 'pending']);
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
+// The scheduled-message routes live with the other message routes
+// above (registered before GET /api/messages/:agentId, which would
+// otherwise shadow GET /api/messages/scheduled).
 
 // ═══════════════════════════════════════════════════════════════
 // v4.0: CAPABILITY DIRECTORY + DECISIONS
 // ═══════════════════════════════════════════════════════════════
 
 // ─── Capability directory ──────────────────────────────────────
-app.get('/api/capabilities', requireApiKey, async (req, res) => {
-  try {
-    const rows = await db.all('SELECT ap.*, a.name FROM agent_presence ap JOIN agents a ON ap.agent_id=a.id');
-    const directory = {};
-    rows.forEach(r => {
-      JSON.parse(r.capabilities||'[]').forEach(c => {
-        if (!directory[c]) directory[c] = [];
-        directory[c].push({ agentId: r.agent_id, name: r.name, state: r.state, bandwidthUpload: r.bandwidth_upload });
-      });
-    });
-    res.json({ directory, totalAgents: rows.length });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
+// Canonical implementation lives with the other capability routes above
+// (GET /api/capabilities — directory grouped by capability incl. presence).
+// The duplicate route that stood here was removed in v4.1.
 
 // ─── Log decision ──────────────────────────────────────────────
 app.post('/api/decisions', requireApiKey, async (req, res) => {

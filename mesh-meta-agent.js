@@ -14,7 +14,7 @@
  * Start: node mesh-meta-agent.js [--port 4001] [--mesh-url http://localhost:4000]
  */
 
-import { WebSocketServer } from 'ws';
+import WebSocket from 'ws';
 import { createClient } from './utils/mesh-client.js';
 
 const META_AGENT_ID = 'MESH_META';
@@ -71,7 +71,13 @@ async function refreshState() {
     agents.forEach(a => state.agents.set(a.id, a));
     
     // Sync tasks
-    const tasks = await mesh.getTasks({ state: 'pending' });
+    // NOTE: mesh-client's getTasks() passes its params as a fetch body,
+    // which throws on GET requests — query the REST endpoint directly.
+    const tasksResp = await fetch(`${MESH_URL}/api/tasks?state=pending`, {
+      headers: { 'X-API-Key': API_KEY, 'Authorization': `Bearer ${API_KEY}` },
+    });
+    if (!tasksResp.ok) throw new Error(`tasks sync ${tasksResp.status}`);
+    const tasks = await tasksResp.json();
     tasks.forEach(t => state.tasks.set(t.id, t));
   } catch (e) {
     console.error('[meta] State refresh failed:', e.message);
@@ -125,13 +131,14 @@ let meshWs = null;
 
 function connectMeshWS() {
   try {
-    meshWs = new WebSocket(`ws://localhost:4000/ws`);
-    
+    const wsUrl = MESH_URL.replace(/^http/, 'ws') + '/ws';
+    meshWs = new WebSocket(wsUrl);
+
     meshWs.on('open', () => {
       console.log('[meta:ws] Connected to mesh');
-      // Register as mesh meta agent
+      // Register as mesh meta agent (server expects type 'register_agent')
       meshWs.send(JSON.stringify({
-        type: 'register',
+        type: 'register_agent',
         agentId: META_AGENT_ID,
         name: META_AGENT_NAME,
         capabilities: META_CAPABILITIES,

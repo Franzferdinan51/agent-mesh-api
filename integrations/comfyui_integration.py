@@ -9,17 +9,18 @@ Usage:
     
     agent = ComfyUIMeshAgent()
     agent.register_with_mesh()
-    agent.listen_for_generation_requests()
+    agent.listen_for_requests()
 """
 
+import os
 import requests
 import json
 import time
 from typing import Optional, Dict, Any
 
-# Agent Mesh settings
-MESH_API_URL = "http://localhost:4000"
-MESH_API_KEY = "openclaw-mesh-default-key"
+# Agent Mesh settings (env overrides match the MCP server's variable names)
+MESH_API_URL = os.environ.get("AGENT_MESH_URL", "http://localhost:4000")
+MESH_API_KEY = os.environ.get("AGENT_MESH_KEY", "openclaw-mesh-default-key")
 
 # ComfyUI settings
 COMFYUI_URL = "http://localhost:8188"
@@ -125,7 +126,11 @@ class ComfyUIMeshAgent:
             )
             
             if resp.status_code == 200:
-                return resp.json().get("messages", [])
+                data = resp.json()
+                # Current API returns a bare array; older shape was {"messages": [...]}
+                if isinstance(data, list):
+                    return data
+                return data.get("messages", [])
             return []
         except:
             return []
@@ -142,7 +147,7 @@ class ComfyUIMeshAgent:
             prompt = content.get("prompt")
             options = content.get("options", {})
             
-            print(f"Received {request_type} request from {message.get('sender')}")
+            print(f"Received {request_type} request from {message.get('sender') or message.get('from')}")
             
             if request_type == "image_generation":
                 return self.generate_image(prompt, options)
@@ -245,25 +250,28 @@ class ComfyUIMeshAgent:
     
     def send_response(self, original_message: dict, response: Dict[str, Any]):
         """Send response back to the requesting agent."""
+        # Current API addresses messages with from/to (sender/recipient were
+        # the old field names); the requester is the original message's sender.
+        requester = original_message.get("sender") or original_message.get("from")
         payload = {
             "content": json.dumps({
                 "type": "inference_response",
                 "original_request": json.loads(original_message.get("content", "{}")),
                 "response": response
             }),
-            "sender": self.agent_name,
-            "recipient": original_message.get("sender"),
+            "from": self.mesh_agent_id or self.agent_name,
+            "to": requester,
             "priority": "normal"
         }
-        
+
         try:
             requests.post(
-                f"{self.mesh_url}/api/messages/send",
+                f"{self.mesh_url}/api/messages",
                 headers={"X-API-Key": self.mesh_key, "Content-Type": "application/json"},
                 json=payload,
                 timeout=10
             )
-            print(f"Sent response to {original_message.get('sender')}")
+            print(f"Sent response to {requester}")
         except Exception as e:
             print(f"Failed to send response: {e}")
     
