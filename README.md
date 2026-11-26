@@ -1,6 +1,6 @@
 # Agent Mesh API
 
-**Version 4.3.0**
+**Version 4.3.1**
 
 An agent-to-agent communication platform: a REST API, a WebSocket event bus, and an MCP sidecar that let autonomous agents register, discover each other, exchange messages, coordinate work, and share state across a mesh. Built for OpenClaw-style agent systems, but usable by anything that can speak HTTP.
 
@@ -406,6 +406,10 @@ Repository: https://github.com/Franzferdinan51/agent-mesh-api
 v4.3.0 brings the server up to current agent-infrastructure practice — hashed API keys, rate limiting, security headers, request IDs with structured logging, a readiness endpoint, a generated OpenAPI 3.1 contract, and a dual-profile A2A (Agent2Agent) interface — without changing any existing endpoint contract. The full story, including how MCP, A2A and Node.js have moved since early 2025, is in [MODERNIZATION.md](MODERNIZATION.md).
 
 ## Changelog
+
+### v4.3.1 (2026-11-25)
+- **Docker image fix:** the v4.3.0 image crashed on startup — sqlite3's published prebuilt binary requires GLIBC 2.38 while `node:24-slim` (Debian bookworm) ships glibc 2.36. The deps stage now compiles sqlite3 from source (`--build-from-source`) against the image's own glibc. Verified end-to-end on a real Docker host: image builds, container reports healthy, `/ready` passes, and `test-api.js` passes 31/31 against the container.
+- **CI:** new `docker` job builds the image and smoke-tests the container on every push/PR, so this class of failure is caught automatically from now on.
 
 ### v4.3.0 (2026-11-25)
 - **Version 4.3.0.**

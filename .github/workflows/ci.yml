@@ -72,6 +72,38 @@ jobs:
             kill "$(cat "$RUNNER_TEMP/server.pid")" || true
           fi
 
+  docker:
+    name: Docker image build + container smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build image
+        run: docker build -t agent-mesh-api:ci .
+
+      - name: Run container and smoke-test it
+        run: |
+          docker run -d --name mesh-ci -p 127.0.0.1:4000:4000 agent-mesh-api:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:4000/health > /dev/null 2>&1; then
+              echo "Container healthy after ${i}s"
+              curl -fsS http://127.0.0.1:4000/ready
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Container did not become healthy in 30s — logs follow:"
+          docker logs mesh-ci || true
+          exit 1
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker logs mesh-ci || true
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f mesh-ci || true
+
   webui:
     name: Web UI build
     runs-on: ubuntu-latest

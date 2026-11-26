@@ -27,7 +27,12 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+# --build-from-source is load-bearing: sqlite3's published prebuilt binary
+# is compiled against GLIBC 2.38, but node:24-slim (Debian bookworm) ships
+# glibc 2.36 — the prebuilt .node fails to load in the runtime stage with
+# "GLIBC_2.38 not found". Compiling here targets this image's own glibc.
+# (Verified the hard way on the first real docker build, 2026-11-25.)
+RUN npm ci --omit=dev --build-from-source && npm cache clean --force
 
 # ── Stage 3: runtime ───────────────────────────────────────────────────
 FROM node:24-slim AS runtime
