@@ -25,12 +25,15 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const MESH_URL = process.env.MESH_URL || 'http://localhost:4000';
-const WS_URL = MESH_URL.replace('http://', 'ws://').replace('https://', 'wss://');
-const AGENT_NAME = process.env.AGENT_NAME;
-const AGENT_ENDPOINT = process.env.AGENT_ENDPOINT;
+// `let`, not `const`: the CLI parser at the bottom of this file applies
+// --mesh-url/--agent-name/--endpoint/--version by assigning these directly
+// (writing process.env there would be too late — these are read at load).
+let MESH_URL = process.env.MESH_URL || 'http://localhost:4000';
+let WS_URL = MESH_URL.replace('http://', 'ws://').replace('https://', 'wss://');
+let AGENT_NAME = process.env.AGENT_NAME;
+let AGENT_ENDPOINT = process.env.AGENT_ENDPOINT;
 const API_KEY = process.env.AGENT_MESH_API_KEY || 'openclaw-mesh-default-key';
-const AGENT_VERSION = process.env.AGENT_VERSION || '1.0.0';
+let AGENT_VERSION = process.env.AGENT_VERSION || '1.0.0';
 // Downloaded payloads are staged here only — never executed and never
 // written over running code. A human/agent step promotes them deliberately.
 const UPDATES_DIR = process.env.AGENT_MESH_UPDATES_DIR || path.join(__dirname, 'updates');
@@ -460,13 +463,14 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const args = process.argv.slice(2);
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--agent-name' && args[i + 1]) {
-      process.env.AGENT_NAME = args[i + 1];
+      AGENT_NAME = process.env.AGENT_NAME = args[i + 1];
     } else if (args[i] === '--endpoint' && args[i + 1]) {
-      process.env.AGENT_ENDPOINT = args[i + 1];
+      AGENT_ENDPOINT = process.env.AGENT_ENDPOINT = args[i + 1];
     } else if (args[i] === '--version' && args[i + 1]) {
-      process.env.AGENT_VERSION = args[i + 1];
+      AGENT_VERSION = process.env.AGENT_VERSION = args[i + 1];
     } else if (args[i] === '--mesh-url' && args[i + 1]) {
-      process.env.MESH_URL = args[i + 1];
+      MESH_URL = process.env.MESH_URL = args[i + 1];
+      WS_URL = MESH_URL.replace('http://', 'ws://').replace('https://', 'wss://');
     }
   }
 

@@ -328,6 +328,26 @@ async function initDb() {
     );
 
     CREATE INDEX IF NOT EXISTS idx_agent_health_status ON agent_health_status(status, last_updated DESC);
+
+    -- v4.2: Decisions voting lifecycle
+    CREATE TABLE IF NOT EXISTS decisions (
+      id TEXT PRIMARY KEY,
+      group_id TEXT,
+      content TEXT NOT NULL,
+      context TEXT,
+      proposed_by TEXT,
+      status TEXT DEFAULT 'open',
+      created_at TEXT DEFAULT (datetime('now')),
+      closed_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS decision_votes (
+      decision_id TEXT,
+      agent_id TEXT,
+      vote TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(decision_id, agent_id)
+    );
   `);
 
   // v4.0: Add thread_id and intent columns if messages table already exists
@@ -994,8 +1014,25 @@ app.post('/api/messages/scheduled', requireApiKey, async (req, res) => {
 // ─── List scheduled ───────────────────────────────────────────
 app.get('/api/messages/scheduled', requireApiKey, async (req, res) => {
   try {
-    const rows = await db.all('SELECT * FROM scheduled_messages WHERE status=? ORDER BY scheduled_at ASC LIMIT 100', ['pending']);
+    const statusParam = req.query.status === undefined ? 'pending' : req.query.status;
+    let rows;
+    if (statusParam === 'all') {
+      rows = await db.all('SELECT * FROM scheduled_messages ORDER BY scheduled_at ASC LIMIT 100');
+    } else {
+      rows = await db.all('SELECT * FROM scheduled_messages WHERE status=? ORDER BY scheduled_at ASC LIMIT 100', [statusParam]);
+    }
     res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Get single scheduled message ─────────────────────────────
+// Registered with the other scheduled routes, before
+// GET /api/messages/:agentId, so it is not shadowed by it.
+app.get('/api/messages/scheduled/:id', requireApiKey, async (req, res) => {
+  try {
+    const row = await db.get('SELECT * FROM scheduled_messages WHERE id=?', [req.params.id]);
+    if (!row) return res.status(404).json({ error: 'Scheduled message not found' });
+    res.json(row);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -2753,6 +2790,27 @@ app.get('/api/messages/:id/reactions', requireApiKey, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─── Remove reaction ───────────────────────────────────────────
+app.delete('/api/messages/:id/reactions', requireApiKey, async (req, res) => {
+  try {
+    const { agentId, emoji } = req.body || {};
+    if (!agentId) return res.status(400).json({ error: 'agentId required' });
+    const agent = await requireAgent(agentId, 'agent');
+    let result;
+    if (emoji) {
+      result = await db.run('DELETE FROM agent_reactions WHERE message_id=? AND agent_id=? AND emoji=?', [req.params.id, agent.id, emoji]);
+    } else {
+      result = await db.run('DELETE FROM agent_reactions WHERE message_id=? AND agent_id=?', [req.params.id, agent.id]);
+    }
+    const removed = result.changes || 0;
+    if (removed === 0) return res.status(404).json({ error: 'Reaction not found' });
+    const payload = { type: 'reaction_removed', messageId: req.params.id, agentId: agent.id };
+    if (emoji) payload.emoji = emoji;
+    broadcast(payload);
+    res.json({ success: true, removed });
+  } catch (e) { res.status(e.statusCode || 500).json({ error: e.message }); }
+});
+
 // ═══════════════════════════════════════════════════════════════
 // v4.0: GROUP ACTIVITY FEED
 // ═══════════════════════════════════════════════════════════════
@@ -2900,6 +2958,30 @@ app.post('/api/tasks/:id/handoff', requireApiKey, async (req, res) => {
 // (GET /api/capabilities — directory grouped by capability incl. presence).
 // The duplicate route that stood here was removed in v4.1.
 
+// ─── Decision helpers ──────────────────────────────────────────
+async function decisionTally(decisionId) {
+  const rows = await db.all('SELECT vote, COUNT(*) as count FROM decision_votes WHERE decision_id=? GROUP BY vote', [decisionId]);
+  const tally = { approve: 0, reject: 0, abstain: 0 };
+  for (const row of rows) {
+    if (Object.prototype.hasOwnProperty.call(tally, row.vote)) tally[row.vote] = row.count;
+  }
+  return tally;
+}
+
+async function normalizeDecision(row) {
+  return {
+    id: row.id,
+    groupId: row.group_id,
+    content: row.content,
+    context: row.context,
+    proposedBy: row.proposed_by,
+    status: row.status,
+    tally: await decisionTally(row.id),
+    createdAt: row.created_at,
+    closedAt: row.closed_at
+  };
+}
+
 // ─── Log decision ──────────────────────────────────────────────
 app.post('/api/decisions', requireApiKey, async (req, res) => {
   try {
@@ -2910,22 +2992,86 @@ app.post('/api/decisions', requireApiKey, async (req, res) => {
       await db.run(`INSERT INTO agent_activity (id,group_id,actor_id,action,target_type,target_id,metadata) VALUES (?,?,?,?,?,?,?)`,
         [uuidv4(), groupId, decidedBy||null, 'DECISION', 'decision', id, JSON.stringify({ content, context: context||'' })]);
     }
-    res.json({ success: true, id, decision: content });
+    const proposer = decidedBy ? await resolveAgent(decidedBy) : null;
+    await db.run(`INSERT INTO decisions (id,group_id,content,context,proposed_by,status) VALUES (?,?,?,?,?,?)`,
+      [id, groupId||null, content, context||null, proposer?.id||decidedBy||null, 'open']);
+    res.json({ success: true, id, decision: content, status: 'open' });
   } catch (e) { res.status(e.statusCode||500).json({ error: e.message }); }
 });
 
 // ─── Get decisions ─────────────────────────────────────────────
 app.get('/api/decisions', requireApiKey, async (req, res) => {
   try {
-    const { groupId, limit=20 } = req.query;
-    let sql = `SELECT * FROM agent_activity WHERE action='DECISION'`;
+    const { limit } = getPagination(req.query, 20, 200);
+    const { groupId, status } = req.query;
+    let sql = `SELECT * FROM decisions WHERE 1=1`;
     const params = [];
     if (groupId) { sql += ' AND group_id=?'; params.push(groupId); }
-    sql += ' ORDER BY created_at DESC LIMIT ?';
-    params.push(Number(limit));
+    if (status) { sql += ' AND status=?'; params.push(status); }
+    sql += ' ORDER BY created_at DESC, rowid DESC LIMIT ?';
+    params.push(limit);
     const rows = await db.all(sql, params);
-    res.json(rows.map(r=>({...r, metadata: JSON.parse(r.metadata||'{}')})));
+    const decisions = [];
+    for (const row of rows) decisions.push(await normalizeDecision(row));
+    res.json(decisions);
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Get single decision ───────────────────────────────────────
+app.get('/api/decisions/:id', requireApiKey, async (req, res) => {
+  try {
+    const row = await db.get('SELECT * FROM decisions WHERE id=?', [req.params.id]);
+    if (!row) return res.status(404).json({ error: 'Decision not found' });
+    const decision = await normalizeDecision(row);
+    const voteRows = await db.all(
+      `SELECT v.*, a.name as agent_name FROM decision_votes v LEFT JOIN agents a ON v.agent_id=a.id WHERE v.decision_id=? ORDER BY v.created_at ASC`, [req.params.id]);
+    decision.votes = voteRows.map(v => ({ agentId: v.agent_id, agentName: v.agent_name || null, vote: v.vote, createdAt: v.created_at }));
+    res.json(decision);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Vote on decision ──────────────────────────────────────────
+app.post('/api/decisions/:id/vote', requireApiKey, async (req, res) => {
+  try {
+    const { agentId, vote } = req.body;
+    if (!['approve', 'reject', 'abstain'].includes(vote)) return res.status(400).json({ error: 'vote must be approve, reject, or abstain' });
+    const decision = await db.get('SELECT * FROM decisions WHERE id=?', [req.params.id]);
+    if (!decision) return res.status(404).json({ error: 'Decision not found' });
+    if (decision.status !== 'open') return res.status(409).json({ error: 'Decision is not open' });
+    const agent = await requireAgent(agentId, 'agent');
+    await db.run(`INSERT OR REPLACE INTO decision_votes (decision_id,agent_id,vote) VALUES (?,?,?)`,
+      [req.params.id, agent.id, vote]);
+    broadcast({ type: 'decision_vote', decisionId: req.params.id, agentId: agent.id, vote });
+    res.json({ success: true, tally: await decisionTally(req.params.id) });
+  } catch (e) { res.status(e.statusCode || 500).json({ error: e.message }); }
+});
+
+// ─── Close decision ────────────────────────────────────────────
+app.patch('/api/decisions/:id', requireApiKey, async (req, res) => {
+  try {
+    const { status, decidedBy } = req.body || {};
+    const decision = await db.get('SELECT * FROM decisions WHERE id=?', [req.params.id]);
+    if (!decision) return res.status(404).json({ error: 'Decision not found' });
+    if (status !== undefined && !['approved', 'rejected', 'closed'].includes(status)) {
+      return res.status(400).json({ error: 'status must be approved, rejected, or closed' });
+    }
+    if (decision.status !== 'open') return res.status(409).json({ error: 'Decision is not open' });
+    const tally = await decisionTally(req.params.id);
+    let finalStatus = status;
+    if (!finalStatus) {
+      if (tally.approve > tally.reject) finalStatus = 'approved';
+      else if (tally.reject > tally.approve) finalStatus = 'rejected';
+      else finalStatus = 'closed';
+    }
+    await db.run(`UPDATE decisions SET status=?, closed_at=datetime('now') WHERE id=?`, [finalStatus, req.params.id]);
+    if (decision.group_id) {
+      const actor = decidedBy ? await resolveAgent(decidedBy) : null;
+      await db.run(`INSERT INTO agent_activity (id,group_id,actor_id,action,target_type,target_id,metadata) VALUES (?,?,?,?,?,?,?)`,
+        [uuidv4(), decision.group_id, actor?.id || decidedBy || null, 'DECISION', 'decision', req.params.id, JSON.stringify({ content: decision.content, outcome: finalStatus, tally })]);
+    }
+    broadcast({ type: 'decision_closed', decisionId: req.params.id, status: finalStatus });
+    res.json({ success: true, id: req.params.id, status: finalStatus, tally });
+  } catch (e) { res.status(e.statusCode || 500).json({ error: e.message }); }
 });
 
 // ═══════════════════════════════════════════════════════════════

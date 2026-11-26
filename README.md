@@ -1,6 +1,6 @@
 # Agent Mesh API
 
-**Version 4.1.0**
+**Version 4.2.0**
 
 An agent-to-agent communication platform: a REST API, a WebSocket event bus, and an MCP sidecar that let autonomous agents register, discover each other, exchange messages, coordinate work, and share state across a mesh. Built for OpenClaw-style agent systems, but usable by anything that can speak HTTP.
 
@@ -14,12 +14,12 @@ Everything is persisted in a single SQLite database, and agents are addressed by
 - **Direct & group messaging** — send by ID or name, batch send (up to 100), inbox, read receipts, message status lifecycle, failed/timeout tracking with retry, broadcast to all agents or to a group.
 - **Presence** — agents advertise state (`online` / `busy` / `idle` / `away` / `offline`), a status message, capabilities, and bandwidth/storage figures; presence changes broadcast over WebSocket.
 - **Conversation threads** — titled threads with context, optional group/parent linkage, and threaded replies.
-- **Semantic reactions** — emoji reactions on messages with built-in semantics (👍 `ACKNOWLEDGED`, 👎 `REJECTED`, 🔄 `PROCESSING`, ✅ `COMPLETED`, 🔥 `URGENT`, …; unknown emoji = `CUSTOM`).
+- **Semantic reactions** — emoji reactions on messages with built-in semantics (👍 `ACKNOWLEDGED`, 👎 `REJECTED`, 🔄 `PROCESSING`, ✅ `COMPLETED`, 🔥 `URGENT`, …; unknown emoji = `CUSTOM`). Reactions can be removed again (`DELETE /api/messages/:id/reactions`, optionally scoped to one emoji).
 - **Tasks** — create, list/filter, claim and update via a state machine (`pending` → `in_progress` → `completed` / `failed` / `cancelled`), priorities, dependencies, and handoff between agents.
 - **Group subscriptions** — per-group, per-event-type notification preferences (join / leave / broadcast / task / message).
-- **Decisions** — log decisions against a group and query them back (see the limitation note in [API_DOCUMENTATION.md](API_DOCUMENTATION.md): decisions are group activity-log entries, there is no voting lifecycle).
+- **Decisions** — a full proposal lifecycle (new in 4.2.0): creating a decision persists it with status `open`; agents vote `approve` / `reject` / `abstain`; closing derives the outcome from the tally (or takes an explicit `approved` / `rejected` / `closed` status). List and read back decision records with their tallies and votes.
 - **Group join requests** — an agent requests to join; the request is approved or rejected, and approval adds the agent as a member.
-- **Scheduled messages** — schedule a direct or group message for a future time; a server-side delivery loop (every 15 s by default) delivers due messages through the normal send paths and marks each row `sent` or `failed`.
+- **Scheduled messages** — schedule a direct or group message for a future time; a server-side delivery loop (every 15 s by default) delivers due messages through the normal send paths and marks each row `sent` or `failed`. Scheduled rows can be read back: list by status (`pending` by default, `?status=all` for everything) or fetch one by ID, whatever its status.
 - **Capabilities directory** — `GET /api/capabilities` returns every capability in the mesh mapped to the agents that offer it, merged from registered capabilities **and** presence-reported capabilities, with each agent's live presence state.
 - **Collective memory** — versioned per-group key-value store with history, shared/readonly types, and membership checks.
 - **Skills** — register, discover, and invoke agent skills.
@@ -65,7 +65,7 @@ node --env-file=.env server.js
 
 ```bash
 curl http://localhost:4000/health
-# {"status":"ok","service":"agent-mesh-api","version":"4.1.0","websocketPath":"/ws", ...}
+# {"status":"ok","service":"agent-mesh-api","version":"4.2.0","websocketPath":"/ws", ...}
 ```
 
 ### Register an agent and send a message
@@ -149,7 +149,7 @@ All configuration is via environment variables. `.env.example` is the canonical 
 ```
                         ┌────────────────────────────────────────────┐
    Agents / clients ───▶│  server.js  (Express 5, port 4000)         │
-   (REST + WebSocket)   │   • REST API (~95 routes)                  │
+   (REST + WebSocket)   │   • REST API (~96 routes)                  │
                         │   • WebSocket event bus at /ws             │
                         │   • SQLite persistence (single file DB)    │
                         │   • Background loops: message-timeout      │
@@ -170,7 +170,7 @@ All configuration is via environment variables. `.env.example` is the canonical 
 ```
 
 - **Server** (`server.js`): one Express 5 process serving the REST API and the WebSocket bus, backed by SQLite (`sqlite`/`sqlite3`). Two background intervals run inside it: the message-timeout checker and the scheduled-message delivery loop.
-- **Clients**: `utils/mesh-client.js` is the JS client library (`createClient(...)`); `websocket-client.js` is a standalone WS listener (`npm run ws-client`); `tools.js` holds the OpenClaw tool definitions; `example-agent.js` is a minimal example agent; `auto-update-client.js` is the update client described below. `integrations/` contains service integrations (e.g. a ComfyUI mesh agent in Python).
+- **Clients**: `utils/mesh-client.js` is the JS client library (`createClient(...)`); `websocket-client.js` is a standalone WS listener (`npm run ws-client`); `tools.js` holds the OpenClaw tool definitions (**58 tools**); `example-agent.js` is a minimal example agent; `auto-update-client.js` is the update client described below. `integrations/` contains service integrations (e.g. a ComfyUI mesh agent in Python).
 - **Meta-agent** (`mesh-meta-agent.js`): separate process, own HTTP API on port 4001, registers itself with the mesh like any other agent.
 - **MCP sidecar** (`mcp-servers/agent-mesh-mcp/`): separate Python process speaking MCP over stdio; it holds no state and forwards to the REST API.
 - **Web UI** (`webui/`): a static React SPA; it talks directly to the REST API from the browser.
@@ -218,7 +218,7 @@ A Python (FastMCP) MCP server lives in `mcp-servers/agent-mesh-mcp/` and exposes
 
 ```bash
 cd mcp-servers/agent-mesh-mcp
-pip install fastmcp httpx
+pip install -r requirements.txt
 AGENT_MESH_URL=http://localhost:4000 \
 AGENT_MESH_KEY=$AGENT_MESH_API_KEY \
 python server.py
@@ -317,8 +317,8 @@ curl -X POST http://localhost:4000/api/files/upload \
 # Create a system update with a verifiable payload
 curl -X POST http://localhost:4000/api/updates \
   -H "Content-Type: application/json" -H "X-API-Key: $AGENT_MESH_API_KEY" \
-  -d '{"version":"4.2.0","updateType":"feature","title":"Next release",
-       "payloadUrl":"https://example.com/agent-mesh-4.2.0.zip","sha256":"<hex sha256 of the payload>"}'
+  -d '{"version":"4.3.0","updateType":"feature","title":"Next release",
+       "payloadUrl":"https://example.com/agent-mesh-4.3.0.zip","sha256":"<hex sha256 of the payload>"}'
 
 # Report a catastrophe
 curl -X POST http://localhost:4000/api/catastrophe \
@@ -359,6 +359,15 @@ Repository: https://github.com/Franzferdinan51/agent-mesh-api
 ---
 
 ## Changelog
+
+### v4.2.0 (2026-11-25)
+- **Version 4.2.0.**
+- **Decision lifecycle:** `POST /api/decisions` now persists a real decision record with status `open` (previously it only wrote a group activity-log entry, and only when a `groupId` was supplied). New endpoints: `GET /api/decisions/:id` (decision + votes + tally), `POST /api/decisions/:id/vote` (`approve` / `reject` / `abstain`; 409 once closed), and `PATCH /api/decisions/:id` to close — the outcome is derived from the tally when no explicit status is given. `GET /api/decisions` now returns decision records (with `status` and `tally`) instead of activity rows; filters: `?groupId=`, `?status=`, `?limit=`.
+- **Reaction removal:** new `DELETE /api/messages/:id/reactions` with `{ agentId, emoji? }` — removes the agent's reaction (one emoji, or all of them when `emoji` is omitted); returns `{ success, removed }`, 404 when there was nothing to remove.
+- **Scheduled-message read-back:** new `GET /api/messages/scheduled/:id` returns a scheduled row in any status (`pending` / `sent` / `failed` / `cancelled`), and `GET /api/messages/scheduled` accepts `?status=` (default `pending`; `all` returns everything).
+- **tools.js:** audited against the route inventory (the v4.1 count of 53 was verified exact) and extended to **58 tools** — new `mesh_reaction_remove`, `mesh_decision_get`, `mesh_decision_vote`, `mesh_decision_close`, `mesh_scheduled_get`; `mesh_scheduled_list` gained a `status` filter and `mesh_decisions_get` a `status` filter. Drift fixes: `mesh_group_create` now sends the required `createdBy` and reads the returned `groupId`; `mesh_memory_store` now sends the required `agentId`.
+- **MCP sidecar docs/deps:** the sub-README's tool list was rewritten from a live `tools/list` run — the server exposes **16 tools**, not the 5 previously listed — and a pinned `requirements.txt` (`fastmcp==4.2.6`, `httpx==0.28.1`) was added and verified.
+- **Docs:** `API_DOCUMENTATION.md` documents the new/changed endpoints and drops the v4.1 limitations they resolve; `SKILL.md` covers the new tools.
 
 ### v4.1.0 (2026-11-25)
 - **Dependencies refreshed:** Express 4 → **5.3.0**, sqlite3 5 → **6.0.1**, uuid 9 → **14.0.3**, axios → 1.21.1, ws → 8.23.0, nodemon → 3.1.14 (sqlite and cors were already latest). Web UI deps patch/minor-updated within their ranges (React 19.3, Vite 7.3.8).

@@ -32,7 +32,7 @@ const NAME_C = `V4AgentC-${RUN}`;
 const UNIQUE_CAP = `v4-cap-${RUN}`;
 
 let agentA, agentB, agentC;
-let taskId, threadId, groupId, directMessageId, scheduledId;
+let taskId, threadId, groupId, directMessageId, scheduledId, decisionId;
 let gapNotes = [];
 
 async function test(name, fn) {
@@ -249,8 +249,8 @@ async function runTests() {
 
   // ─── 3. Reactions ────────────────────────────────────────────
   // Real API: POST /api/messages/:id/reactions {agentId, emoji} →
-  // {success, id, semantic}; GET same path → {reactions, semantics}.
-  // There is NO delete-reaction route in server.js (see gap note).
+  // {success, id, semantic}; GET same path → {reactions, semantics};
+  // DELETE same path {agentId, emoji?} removes reactions.
 
   results.push(await test('Reactions: send message to react to', async () => {
     const message = await post('/api/messages', {
@@ -281,22 +281,19 @@ async function runTests() {
     }
   }));
 
-  results.push(await test('Reactions: removal is not supported by the API (gap probe)', async () => {
-    // No DELETE route exists for reactions; the only DELETE under
-    // /api/messages/:id deletes the whole message, so we probe the
-    // reactions path and record the gap instead of removing anything.
-    const res = await raw('DELETE', `/api/messages/${directMessageId}/reactions`, { agentId: agentB, emoji: '👍' });
-    if (res.status !== 404) {
-      // If a future version adds removal, verify the reaction is gone.
-      const view = await get(`/api/messages/${directMessageId}/reactions`);
-      if (view.reactions.some((r) => r.agent_id === agentB)) {
-        throw new Error(`DELETE returned ${res.status} but reaction still present`);
-      }
-      console.log('  → Reaction removal supported and verified');
-      return;
+  results.push(await test('Reactions: remove reaction and verify it is gone', async () => {
+    const res = await del(`/api/messages/${directMessageId}/reactions`, { agentId: agentB, emoji: '👍' });
+    if (!res.success) throw new Error('Reaction removal did not return success');
+    if (res.removed !== 1) throw new Error(`Expected removed 1, got ${res.removed}`);
+
+    const view = await get(`/api/messages/${directMessageId}/reactions`);
+    if (view.reactions.some((r) => r.agent_id === agentB && r.emoji === '👍')) {
+      throw new Error('Reaction still present after DELETE');
     }
-    gapNotes.push('Reactions: no removal endpoint — DELETE /api/messages/:id/reactions returns 404; a reaction can only be overwritten (INSERT OR REPLACE per agent+message), never removed.');
-    console.log('  → Confirmed: no reaction-removal route (404). Gap noted in report.');
+
+    const again = await raw('DELETE', `/api/messages/${directMessageId}/reactions`, { agentId: agentB, emoji: '👍' });
+    if (again.status !== 404) throw new Error(`Expected 404 removing a missing reaction, got ${again.status}`);
+    console.log('  → Reaction removed; second DELETE correctly 404s');
   }));
 
   // ─── 4. Presence ─────────────────────────────────────────────
@@ -366,10 +363,11 @@ async function runTests() {
 
   // ─── 6. Decisions ────────────────────────────────────────────
   // Real API: POST /api/decisions {groupId, content, context,
-  // decidedBy} — a decision is only persisted (as a DECISION activity
-  // row) when groupId is supplied. GET /api/decisions?groupId= reads
-  // them back with the content inside `metadata`. There is NO voting
-  // endpoint in server.js (see gap note).
+  // decidedBy} creates a decision record (status 'open') and, when
+  // groupId is supplied, also logs a DECISION activity row.
+  // GET /api/decisions returns decision records with tallies;
+  // POST /api/decisions/:id/vote votes; PATCH /api/decisions/:id
+  // closes (deriving the outcome from the tally when omitted).
 
   results.push(await test('Decisions: create decision and read back state', async () => {
     const content = `Adopt v4 test plan ${RUN}`;
@@ -381,23 +379,60 @@ async function runTests() {
     });
     if (!res.success || !res.id) throw new Error('Decision create did not return id');
     if (res.decision !== content) throw new Error('Decision echo mismatch');
+    if (res.status !== 'open') throw new Error(`Expected status open, got ${res.status}`);
+    decisionId = res.id;
 
     const list = await get(`/api/decisions?groupId=${groupId}`);
     if (!Array.isArray(list)) throw new Error('Expected array of decisions');
-    const mine = list.find((d) => d.target_id === res.id);
+    const mine = list.find((d) => d.id === res.id);
     if (!mine) throw new Error('Decision missing from GET /api/decisions?groupId=');
-    if (mine.action !== 'DECISION') throw new Error(`Expected action DECISION, got ${mine.action}`);
-    if (mine.metadata?.content !== content) throw new Error('Decision content mismatch on read-back');
-    console.log(`  → Decision recorded: "${mine.metadata.content}"`);
+    if (mine.content !== content) throw new Error('Decision content mismatch on read-back');
+    if (mine.status !== 'open') throw new Error(`Expected status open on read-back, got ${mine.status}`);
+    console.log(`  → Decision recorded: "${mine.content}"`);
   }));
 
-  results.push(await test('Decisions: voting is not supported by the API (gap probe)', async () => {
-    // No vote route exists in server.js; decisions are append-only log
-    // entries. Probe a plausible vote path and record the gap.
-    const res = await raw('POST', '/api/decisions/vote', { agentId: agentB, decision: 'yes' });
-    if (res.status !== 404) throw new Error(`Expected 404 for vote probe, got ${res.status}`);
-    gapNotes.push('Decisions: no voting/proposal lifecycle — POST /api/decisions only logs a DECISION activity row (and only persists when groupId is given); there is no vote, approve, or state-transition endpoint.');
-    console.log('  → Confirmed: no decision-voting route (404). Gap noted in report.');
+  results.push(await test('Decisions: votes accumulate into the tally', async () => {
+    let res = await post(`/api/decisions/${decisionId}/vote`, { agentId: agentB, vote: 'approve' });
+    if (!res.success) throw new Error('Vote by B did not return success');
+    res = await post(`/api/decisions/${decisionId}/vote`, { agentId: agentC, vote: 'approve' });
+    if (!res.success) throw new Error('Vote by C did not return success');
+    res = await post(`/api/decisions/${decisionId}/vote`, { agentId: agentA, vote: 'reject' });
+    if (!res.success) throw new Error('Vote by A did not return success');
+    const { tally } = res;
+    if (tally.approve !== 2 || tally.reject !== 1 || tally.abstain !== 0) {
+      throw new Error(`Expected tally {approve:2, reject:1, abstain:0}, got ${JSON.stringify(tally)}`);
+    }
+    console.log(`  → Tally: ${JSON.stringify(tally)}`);
+  }));
+
+  results.push(await test('Decisions: bad vote value is rejected and re-vote replaces', async () => {
+    const bad = await raw('POST', `/api/decisions/${decisionId}/vote`, { agentId: agentA, vote: 'maybe' });
+    if (bad.status !== 400) throw new Error(`Expected 400 for bad vote value, got ${bad.status}`);
+
+    const res = await post(`/api/decisions/${decisionId}/vote`, { agentId: agentA, vote: 'approve' });
+    const { tally } = res;
+    if (tally.approve !== 3 || tally.reject !== 0 || tally.abstain !== 0) {
+      throw new Error(`Expected tally {approve:3, reject:0, abstain:0} after re-vote, got ${JSON.stringify(tally)}`);
+    }
+    console.log(`  → Re-vote replaced: ${JSON.stringify(tally)}`);
+  }));
+
+  results.push(await test('Decisions: single decision shows its votes', async () => {
+    const view = await get(`/api/decisions/${decisionId}`);
+    if (view.id !== decisionId) throw new Error('Decision id mismatch on single read');
+    if (!Array.isArray(view.votes)) throw new Error('Expected votes array');
+    if (view.votes.length !== 3) throw new Error(`Expected 3 votes, got ${view.votes.length}`);
+    if (view.tally.approve !== 3) throw new Error(`Expected tally approve 3, got ${JSON.stringify(view.tally)}`);
+  }));
+
+  results.push(await test('Decisions: PATCH with no status derives approved; vote after close is 409', async () => {
+    const res = await patch(`/api/decisions/${decisionId}`, {});
+    if (!res.success) throw new Error('PATCH did not return success');
+    if (res.status !== 'approved') throw new Error(`Expected derived status approved, got ${res.status}`);
+
+    const late = await raw('POST', `/api/decisions/${decisionId}/vote`, { agentId: agentB, vote: 'reject' });
+    if (late.status !== 409) throw new Error(`Expected 409 voting on a closed decision, got ${late.status}`);
+    console.log('  → Decision closed as approved; late vote correctly 409s');
   }));
 
   // ─── 7. Group join requests ──────────────────────────────────
@@ -438,10 +473,9 @@ async function runTests() {
   // Real API: POST /api/messages/scheduled {from, to, content,
   // sendAt} → {success, id, scheduledAt}. The server delivery loop
   // (default 15s) delivers due messages and marks the row sent.
-  // NOTE: GET /api/messages/scheduled only ever returns *pending*
-  // rows — and is currently shadowed by GET /api/messages/:agentId
-  // (see gap note) — so delivery into the recipient inbox is the
-  // observable proof, polled here for up to ~30s.
+  // GET /api/messages/scheduled/:id reads a row back in any status;
+  // GET /api/messages/scheduled defaults to pending rows, with
+  // ?status= filtering (or ?status=all).
 
   results.push(await test('Scheduled: schedule a message due in ~2 seconds', async () => {
     const sendAt = new Date(Date.now() + 2000).toISOString();
@@ -469,21 +503,19 @@ async function runTests() {
     console.log(`  → Delivered message ID: ${found.id}`);
   }));
 
-  results.push(await test('Scheduled: sent status exposure (gap probe)', async () => {
-    // If the list endpoint is reachable it only returns pending rows,
-    // so a delivered message must no longer appear there. Currently
-    // the route is shadowed by GET /api/messages/:agentId and 404s —
-    // either way there is no API surface that reports status:'sent'.
-    const res = await raw('GET', '/api/messages/scheduled');
-    if (res.status === 200 && Array.isArray(res.json)) {
-      if (res.json.some((r) => r.id === scheduledId)) {
-        throw new Error('Delivered scheduled message still listed as pending');
-      }
-      console.log('  → Delivered message no longer listed as pending');
-      return;
-    }
-    gapNotes.push(`Scheduled messages: no API exposes the sent status — GET /api/messages/scheduled only returns pending rows and currently returns HTTP ${res.status} because it is shadowed by GET /api/messages/:agentId (registered earlier in server.js). Delivery was verified via the recipient inbox instead.`);
-    console.log(`  → List endpoint unreachable (HTTP ${res.status}, route shadowing). Gap noted in report.`);
+  results.push(await test('Scheduled: sent status is readable by id and via ?status=', async () => {
+    const row = await get(`/api/messages/scheduled/${scheduledId}`);
+    if (row.id !== scheduledId) throw new Error('Scheduled row id mismatch on read-back');
+    if (row.status !== 'sent') throw new Error(`Expected status sent, got ${row.status}`);
+
+    const sent = await get('/api/messages/scheduled?status=sent');
+    if (!Array.isArray(sent)) throw new Error('Expected array from ?status=sent');
+    if (!sent.some((r) => r.id === scheduledId)) throw new Error('Delivered message missing from ?status=sent list');
+
+    const pending = await get('/api/messages/scheduled');
+    if (!Array.isArray(pending)) throw new Error('Expected array from default scheduled list');
+    if (pending.some((r) => r.id === scheduledId)) throw new Error('Delivered message still in default (pending) list');
+    console.log('  → Sent status exposed by id and ?status=sent; absent from default list');
   }));
 
   // ─── 9. Capabilities directory ───────────────────────────────

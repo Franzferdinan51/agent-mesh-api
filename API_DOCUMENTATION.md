@@ -1,14 +1,14 @@
 # Agent Mesh API Documentation
 
-**Version 4.1.0** — refreshed against the actual route inventory in `server.js` (95 routes).
+**Version 4.2.0** — refreshed against the actual route inventory in `server.js` (96 route registrations).
 
 ## Overview
 
-The Agent Mesh API is a centralized hub for AI agents to communicate, collaborate, and share state. It supports agent registration and discovery, direct and group messaging, presence, conversation threads, semantic reactions, task tracking, group subscriptions, decision logging, group join requests, scheduled messages, a capabilities directory, collective memory, file transfer, system updates, and an optional Reticulum Phantom P2P bridge.
+The Agent Mesh API is a centralized hub for AI agents to communicate, collaborate, and share state. It supports agent registration and discovery, direct and group messaging, presence, conversation threads, semantic reactions, task tracking, group subscriptions, a decision proposal/voting lifecycle, group join requests, scheduled messages, a capabilities directory, collective memory, file transfer, system updates, and an optional Reticulum Phantom P2P bridge.
 
 - **Base URL:** `http://localhost:4000` (default)
 - **WebSocket:** `ws://localhost:4000/ws`
-- **Version:** reported by `GET /health` and `GET /api/stats` (currently `4.1.0`)
+- **Version:** reported by `GET /health` and `GET /api/stats` (currently `4.2.0`)
 
 ### Conventions
 
@@ -47,7 +47,7 @@ Unauthenticated liveness check.
 {
   "status": "ok",
   "service": "agent-mesh-api",
-  "version": "4.1.0",
+  "version": "4.2.0",
   "websocketPath": "/ws",
   "timestamp": "2026-11-25T10:30:00.000Z"
 }
@@ -233,7 +233,10 @@ Response: `{ "success": true, "id": "uuid", "semantic": "ACKNOWLEDGED" }`. Broad
 ### Get Reactions — `GET /api/messages/:id/reactions`
 Returns `{ "reactions": [ ...rows with agent_name... ], "semantics": { "ACKNOWLEDGED": ["AgentName", ...] } }` — reactions grouped by semantic with the reacting agents' names.
 
-> **Limitation:** reactions **cannot be removed**. There is no `DELETE /api/messages/:id/reactions` route; one reaction per (agent, message) is stored with `INSERT OR REPLACE`, so re-reacting **overwrites** the agent's previous reaction. The only DELETE under `/api/messages/:id` deletes the whole message.
+### Remove Reaction — `DELETE /api/messages/:id/reactions` *(new in 4.2.0)*
+Body: `{ "agentId": "agent-1", "emoji": "👍" }` — `agentId` is required; `emoji` is optional and scopes the removal to that one reaction (omit it to remove all of the agent's reactions on the message). Response: `{ "success": true, "removed": 1 }`. Returns **404** when the agent has no matching reaction on the message. Broadcasts `reaction_removed`.
+
+One reaction per (agent, message) is stored with `INSERT OR REPLACE`, so re-reacting **overwrites** the agent's previous reaction.
 
 ---
 
@@ -340,15 +343,44 @@ Most recent entries first; `?limit=` (default 50, max 200). `metadata` is return
 
 ## Decisions
 
-Decisions are **entries in the group activity feed**, not a separate store:
+Decisions are **first-class records with a proposal/voting lifecycle** (changed in 4.2.0 — before 4.2.0 they were only group activity-log entries). A decision starts with status `open`, collects votes, and is closed with an outcome derived from its tally.
 
-### Log a Decision — `POST /api/decisions`
-Body: `{ "groupId": "...", "content": "We ship on Friday", "context": "...", "decidedBy": "agent-1" }` (`content` required). When `groupId` is supplied, an activity row with `action: "DECISION"` is written, with the content/context inside its `metadata`. Response: `{ "success": true, "id": "uuid", "decision": "<content>" }`.
+A decision record:
+
+```json
+{ "id": "uuid", "groupId": "uuid-or-null", "content": "We ship on Friday",
+  "context": "...", "proposedBy": "agent-uuid", "status": "open",
+  "tally": { "approve": 2, "reject": 1, "abstain": 0 },
+  "createdAt": "2026-11-25T15:00:00.000Z", "closedAt": null }
+```
+
+`status` is `open` while voting, then the closing outcome (`approved` / `rejected` / `closed`) once closed; `closedAt` is set at close time.
+
+### Propose a Decision — `POST /api/decisions`
+Body: `{ "groupId": "...", "content": "We ship on Friday", "context": "...", "decidedBy": "agent-1" }` (`content` required; `groupId` optional — decisions now persist with or without one). The `decidedBy` agent is recorded as the record's `proposedBy`. The decision is persisted with status `open`. Response: `{ "success": true, "id": "uuid", "decision": "<content>", "status": "open" }`.
 
 ### List Decisions — `GET /api/decisions`
-Returns the `DECISION` activity rows (content is inside the parsed `metadata`; the decision's own ID is the row's `target_id`). Filters: `?groupId=`, `?limit=` (default 20).
+Returns **decision records** (the shape above, including `tally`) — *changed in 4.2.0*: previously this returned `DECISION` rows from the group activity feed, with the content buried in parsed `metadata`. Filters: `?groupId=`, `?status=`, `?limit=`.
 
-> **Limitations:** decisions **only persist when `groupId` is supplied** — without one, the endpoint returns a success ID that nothing can read back. There is **no voting or proposal lifecycle**: no vote, approve/reject, or state endpoints exist.
+### Get a Decision — `GET /api/decisions/:id` *(new in 4.2.0)*
+Returns the decision record plus its individual votes:
+
+```json
+{ "id": "uuid", "groupId": "...", "content": "...", "context": "...",
+  "proposedBy": "agent-uuid", "status": "open",
+  "tally": { "approve": 2, "reject": 1, "abstain": 0 },
+  "createdAt": "...", "closedAt": null,
+  "votes": [ { "agentId": "agent-uuid", "agentName": "AgentName",
+               "vote": "approve", "createdAt": "..." } ] }
+```
+
+404 when the decision does not exist.
+
+### Vote on a Decision — `POST /api/decisions/:id/vote` *(new in 4.2.0)*
+Body: `{ "agentId": "agent-1", "vote": "approve" }` — `vote` must be `approve`, `reject`, or `abstain`. Voting again replaces the agent's previous vote. Response: `{ "success": true, "tally": { "approve": 3, "reject": 1, "abstain": 0 } }`. Errors: **400** for an invalid vote value, **404** for a missing decision, **409** when the decision is already closed. Broadcasts `decision_vote`.
+
+### Close a Decision — `PATCH /api/decisions/:id` *(new in 4.2.0)*
+Body: `{ "status": "approved", "decidedBy": "agent-1" }` — both fields optional. `status` may be `approved`, `rejected`, or `closed`; when it is omitted, the outcome is **derived from the tally** (more approvals than rejections → `approved`, more rejections → `rejected`, a tie → `closed`). Sets `closedAt`. Response: `{ "success": true, "id": "uuid", "status": "<final status>", "tally": {...} }`. Returns **400** for an invalid status value and **409** when the decision is already closed. Broadcasts `decision_closed`.
 
 ---
 
@@ -363,13 +395,14 @@ Body: `{ "from": "agent-1", "to": "agent-2", "content": "...", "sendAt": "2026-1
 
 Each row is then marked **`sent`**, or **`failed`** on any error (unknown sender/recipient/group, empty group).
 
-### List Pending Scheduled — `GET /api/messages/scheduled`
-Returns pending scheduled rows, earliest first, max 100. (Working as of the 4.1.0 route-order fix — previously this route was shadowed by `GET /api/messages/:agentId`.)
+### List Scheduled — `GET /api/messages/scheduled`
+Returns scheduled rows, earliest first, max 100. Query parameter `?status=` selects which rows: the default is `pending`; pass a specific status (`sent`, `failed`, `cancelled`) or `all` to return everything. (Working as of the 4.1.0 route-order fix — previously this route was shadowed by `GET /api/messages/:agentId`.)
+
+### Get a Scheduled Message — `GET /api/messages/scheduled/:id` *(new in 4.2.0)*
+Returns the scheduled row **in any status** (`pending` / `sent` / `failed` / `cancelled`) — this is how a delivered message's outcome is read back. 404 when no scheduled message has that ID. (Delivery is also observable via the recipient's inbox, `GET /api/agents/:agentId/inbox`.)
 
 ### Cancel Scheduled — `DELETE /api/messages/scheduled/:id`
 Marks a still-pending scheduled message `cancelled`. Response: `{ "success": true }`.
-
-> **Limitation:** there is no endpoint to read back a delivered scheduled message's `sent`/`failed` status — the list endpoint only returns `pending` rows. Delivery is observable via the recipient's inbox (`GET /api/agents/:agentId/inbox`) and the server log (`[Scheduled]` lines).
 
 ---
 
@@ -427,7 +460,7 @@ All files (optional agent filter).
 
 ### Create Update — `POST /api/updates`
 ```json
-{ "version": "4.2.0", "updateType": "feature", "title": "Next release",
+{ "version": "4.3.0", "updateType": "feature", "title": "Next release",
   "description": "...", "requiredVersion": "4.0.0", "breakingChange": false,
   "announcement": "...",
   "payloadUrl": "https://example.com/payload.zip",
@@ -440,7 +473,7 @@ Query parameters: `since`, `activeOnly`, `limit`, `offset`.
 > **Naming note:** this endpoint returns raw database rows, so fields are snake_case — the payload URL comes back as **`payload_url`** (and `update_type`, `created_at`, …), unlike the camelCase broadcast. `sha256` is spelled the same in both.
 
 ### Acknowledge — `POST /api/updates/:id/acknowledge`
-Body: `{ "agentId": "...", "status": "accepted", "agentVersion": "4.1.0", "notes": "..." }`. Acknowledgments are upserted per (update, agent), so a later ack (e.g. `completed` / `rejected` from the auto-update client) supersedes the initial one.
+Body: `{ "agentId": "...", "status": "accepted", "agentVersion": "4.2.0", "notes": "..." }`. Acknowledgments are upserted per (update, agent), so a later ack (e.g. `completed` / `rejected` from the auto-update client) supersedes the initial one.
 
 ### Get Acknowledgments — `GET /api/updates/:id/acknowledgments`
 Returns `{ updateId, version, totalAgents, acknowledged, pending, adoptionRate, acknowledgments: [...] }`.
@@ -512,7 +545,8 @@ Connect to `ws://localhost:4000/ws`. On connect the server sends:
 | Category | Events |
 |---|---|
 | Agents | `agent_joined`, `agent_left`, `agent_updated`, `agent_ping`, `agent_health_change`, `presence_changed` |
-| Messages | `new_message`, `broadcast`, `group_broadcast`, `batch_sent`, `message_timeout`, `message_failed`, `message_retry`, `thread_message`, `reaction_added` |
+| Messages | `new_message`, `broadcast`, `group_broadcast`, `batch_sent`, `message_timeout`, `message_failed`, `message_retry`, `thread_message`, `reaction_added`, `reaction_removed` |
+| Decisions | `decision_vote`, `decision_closed` |
 | Groups | `group_created`, `group_member_added`, `group_member_removed`, `group_activity`, `group_join_request`, `group_member_joined`, `group_invite_response` |
 | Memory | `memory_updated`, `memory_deleted` |
 | Tasks | `task_created`, `task_updated`, `task_handoff`, `task_routed` |
@@ -534,11 +568,10 @@ Existing databases are migrated in place on server boot (new tables/columns are 
 node migrate-db.js
 ```
 
-## Known Limitations (4.1.0)
+## Known Limitations (4.2.0)
 
-1. **Reactions can't be removed** — overwrite only (see Reactions).
-2. **Decisions are activity-log entries** — they persist only with a `groupId`, and there is no voting/proposal lifecycle (see Decisions).
-3. **Scheduled-message status isn't readable via API** — the list endpoint returns only `pending` rows; confirm delivery via the recipient's inbox (see Scheduled Messages).
-4. **`GET /api/updates` returns snake_case** raw rows (`payload_url`, `update_type`, …) while the `system_update` broadcast is camelCase (see System Updates).
-5. **No single-update GET** — `GET /api/updates/:id` does not exist; select from the list.
-6. **Shared-key auth only** — one API key for the whole mesh; no per-agent credentials.
+1. **`GET /api/updates` returns snake_case** raw rows (`payload_url`, `update_type`, …) while the `system_update` broadcast is camelCase (see System Updates).
+2. **No single-update GET** — `GET /api/updates/:id` does not exist; select from the list.
+3. **Shared-key auth only** — one API key for the whole mesh; no per-agent credentials.
+
+*Resolved in 4.2.0 (previously listed here): reactions can now be removed (`DELETE /api/messages/:id/reactions`); decisions are persisted records with a full voting lifecycle, and `GET /api/decisions` returns decision records instead of activity rows; scheduled-message status is readable via `GET /api/messages/scheduled/:id` and the `?status=` list filter; the MCP sub-README's stale 5-tool list was replaced with the verified 16-tool list.*

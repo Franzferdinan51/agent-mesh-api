@@ -86,7 +86,9 @@ async function refreshState() {
 
 // ─── Intelligence Functions ─────────────────────────────────────
 async function routeTask(task, requires) {
-  const caps = requires ? requires.split(',').map(s => s.trim()) : [];
+  const caps = Array.isArray(requires)
+    ? requires.map(s => String(s).trim()).filter(Boolean)
+    : requires ? String(requires).split(',').map(s => s.trim()).filter(Boolean) : [];
   const scored = [];
   
   for (const [id, agent] of state.agents) {

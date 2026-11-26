@@ -20,7 +20,7 @@ npm run dev
 Then open the dev server URL shown by Vite.
 
 In the UI, set:
-- Mesh Base URL (e.g. `http://100.74.88.40:4000`)
+- Mesh Base URL (e.g. `http://localhost:4000`)
 - API key (e.g. `openclaw-mesh-default-key`)
 
 Both are stored in localStorage.

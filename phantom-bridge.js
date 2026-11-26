@@ -189,7 +189,7 @@ export async function phantomStatus() {
     return {
       success: false,
       available: false,
-      reticulumeConnected: false,
+      reticulumConnected: false,
       probeOutput: '',
       identityOutput: '',
       note: PHANTOM_UNAVAILABLE_MSG
@@ -208,7 +208,7 @@ export async function phantomStatus() {
   return {
     success: true,
     available: true,
-    reticulumeConnected: isConnected,
+    reticulumConnected: isConnected,
     probeOutput: probeResult.stdout.substring(0, 500),
     identityOutput: idResult.stdout.substring(0, 300),
     note: isConnected

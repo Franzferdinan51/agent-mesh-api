@@ -1,0 +1,4 @@
+# Agent Mesh MCP server dependencies (verified 2026-11-25, v4.2.0 pass:
+# server starts and answers initialize + tools/list with these pins)
+fastmcp==4.2.6
+httpx==0.28.1

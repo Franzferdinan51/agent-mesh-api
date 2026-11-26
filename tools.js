@@ -271,10 +271,12 @@ export const tools = {
     async mesh_group_create(params) {
       const name = params.name;
       const description = params.description || '';
+      const createdBy = params.createdBy || agentId;
       if (!name) return { error: 'name is required' };
+      if (!createdBy) return { error: 'createdBy is required (register first or pass params.createdBy)' };
       try {
-        const response = await api.post('/api/groups', { name, description });
-        return { success: true, groupId: response.data.id, name };
+        const response = await api.post('/api/groups', { name, description, createdBy });
+        return { success: true, groupId: response.data.groupId, name };
       } catch (error) {
         return { success: false, error: error.response?.data?.error || error.message };
       }
@@ -324,9 +326,11 @@ export const tools = {
       const groupId = params.groupId || params.name;
       const key = params.key;
       const value = params.value;
+      const storeAgentId = params.agentId || agentId;
       if (!groupId || !key || value === undefined) return { error: 'groupId, key, and value are required' };
+      if (!storeAgentId) return { error: 'agentId is required (register first or pass params.agentId)' };
       try {
-        const response = await api.post(`/api/groups/${groupId}/memory`, { key, value });
+        const response = await api.post(`/api/groups/${groupId}/memory`, { key, value, agentId: storeAgentId });
         return { success: true, version: response.data.version };
       } catch (error) {
         return { success: false, error: error.response?.data?.error || error.message };
@@ -470,6 +474,17 @@ export const tools = {
         return response.data;
       } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
     },
+    async mesh_reaction_remove(params = {}) {
+      try {
+        const { messageId, emoji } = params;
+        const removeAgentId = params.agentId || agentId;
+        if (!messageId || !removeAgentId) return { error: 'messageId and agentId are required' };
+        const body = { agentId: removeAgentId };
+        if (emoji) body.emoji = emoji;
+        const response = await api.delete('/api/messages/' + messageId + '/reactions', { data: body });
+        return response.data;
+      } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+    },
     async mesh_activity_log(params = {}) {
       try {
         const { groupId, action, targetType, targetId, metadata } = params;
@@ -534,9 +549,19 @@ export const tools = {
         return response.data;
       } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
     },
-    async mesh_scheduled_list() {
+    async mesh_scheduled_list(params = {}) {
       try {
-        const response = await api.get('/api/messages/scheduled');
+        const { status } = params;
+        const p = {}; if (status) p.status = status;
+        const response = await api.get('/api/messages/scheduled', { params: p });
+        return { success: true, scheduled: response.data };
+      } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+    },
+    async mesh_scheduled_get(params = {}) {
+      try {
+        const { messageId } = params;
+        if (!messageId) return { error: 'messageId is required' };
+        const response = await api.get('/api/messages/scheduled/' + messageId);
         return { success: true, scheduled: response.data };
       } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
     },
@@ -556,16 +581,48 @@ export const tools = {
     async mesh_decision_log(params = {}) {
       try {
         const { groupId, content, context } = params;
-        const response = await api.post('/api/decisions', { groupId, content, context, decidedBy: agentId });
+        const proposer = params.proposedBy || agentId;
+        // v4.2: creating a decision persists it with status 'open'; the
+        // proposer is recorded as proposedBy (decidedBy kept for compat).
+        const response = await api.post('/api/decisions', { groupId, content, context, proposedBy: proposer, decidedBy: proposer });
         return response.data;
       } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
     },
     async mesh_decisions_get(params = {}) {
       try {
-        const { groupId, limit } = params;
-        const p = {}; if (groupId) p.groupId = groupId; if (limit) p.limit = limit;
+        const { groupId, status, limit } = params;
+        const p = {}; if (groupId) p.groupId = groupId; if (status) p.status = status; if (limit) p.limit = limit;
         const response = await api.get('/api/decisions', { params: p });
         return { success: true, decisions: response.data };
+      } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+    },
+    async mesh_decision_get(params = {}) {
+      try {
+        const { decisionId } = params;
+        if (!decisionId) return { error: 'decisionId is required' };
+        const response = await api.get('/api/decisions/' + decisionId);
+        return response.data;
+      } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+    },
+    async mesh_decision_vote(params = {}) {
+      try {
+        const { decisionId, vote } = params;
+        const voterId = params.agentId || agentId;
+        if (!decisionId || !voterId || !vote) return { error: 'decisionId, agentId, and vote are required' };
+        const response = await api.post('/api/decisions/' + decisionId + '/vote', { agentId: voterId, vote });
+        return response.data;
+      } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
+    },
+    async mesh_decision_close(params = {}) {
+      try {
+        const { decisionId, status } = params;
+        if (!decisionId) return { error: 'decisionId is required' };
+        const body = {};
+        if (status) body.status = status;
+        const decider = params.decidedBy || agentId;
+        if (decider) body.decidedBy = decider;
+        const response = await api.patch('/api/decisions/' + decisionId, body);
+        return response.data;
       } catch (error) { return { success: false, error: error.response?.data?.error || error.message }; }
     },
     async mesh_group_request(params = {}) {

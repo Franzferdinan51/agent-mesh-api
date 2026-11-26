@@ -241,7 +241,7 @@ async function runTests() {
   // Summary
   log('\n=== Test Summary ===', 'blue');
   log(`Total tests: ${tests.length + 2}`, 'blue');
-  log(`Passed: ${passed}`, 'green');
+  log(`Passed: ${passed + 2} (incl. health + schema checks)`, 'green');
   log(`Failed: ${failed}`, failed > 0 ? 'red' : 'green');
 
   if (failed === 0) {
