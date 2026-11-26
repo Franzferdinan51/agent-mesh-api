@@ -852,3 +852,45 @@ button:disabled {
     font-size: 16px;
   }
 }
+
+/* ── v4.3 additions: tabs, badges, chips, tallies, layout helpers ── */
+.tab-nav { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:20px; }
+.tab-btn { background:var(--bg-tertiary); color:var(--text-secondary); border:1px solid var(--border-color); }
+.tab-btn.active { background:var(--accent-primary); color:#fff; border-color:var(--accent-primary); }
+.header-actions { display:flex; gap:8px; flex-wrap:wrap; }
+.btn-link { text-decoration:none; display:inline-flex; align-items:center; padding:10px 20px; border-radius:var(--radius-md); font-weight:600; font-size:14px; }
+.header-config { margin-top:16px; }
+.dot { display:inline-block; width:9px; height:9px; border-radius:50%; vertical-align:middle; }
+.dot-ok { background:var(--accent-success); } .dot-bad { background:var(--accent-error); }
+.badge { background:var(--bg-active); color:var(--text-secondary); font-size:11px; font-weight:600; padding:3px 9px; border-radius:999px; text-transform:lowercase; }
+.badge-online, .badge-approved { background:rgba(61,184,135,.15); color:var(--accent-success); }
+.badge-offline { background:rgba(209,74,74,.15); color:var(--accent-error); }
+.badge-busy { background:rgba(212,167,74,.15); color:var(--accent-warning); }
+.badge-idle, .badge-away { background:rgba(74,209,207,.12); color:var(--accent-info); }
+.hint { color:var(--text-muted); font-size:12px; margin:8px 0; }
+.row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+.stack { display:flex; flex-direction:column; gap:16px; min-width:260px; }
+.split { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+@media (max-width:900px){ .split{ grid-template-columns:1fr; } }
+.field { display:flex; flex-direction:column; gap:6px; margin-bottom:12px; }
+.field span { font-size:12px; font-weight:500; color:var(--text-secondary); text-transform:uppercase; letter-spacing:.5px; }
+.field.inline { flex-direction:row; align-items:center; margin-bottom:0; }
+.list-row { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:10px 12px; background:var(--bg-tertiary); border:1px solid var(--border-color); border-radius:var(--radius-md); margin-bottom:8px; }
+.btn-small { padding:6px 12px; font-size:12px; }
+.subhead { font-size:14px; font-weight:600; margin:14px 0 10px; }
+.selected-card { border-color:var(--accent-primary) !important; }
+.reaction-row { display:flex; gap:6px; flex-wrap:wrap; margin-top:10px; }
+.chip { background:var(--bg-active); color:var(--text-primary); border:1px solid var(--border-color); font-size:12px; font-weight:500; padding:4px 10px; border-radius:999px; }
+.chip:hover { border-color:var(--border-hover); }
+.chip-mine { border-color:var(--accent-primary); color:var(--accent-secondary); }
+.chip-warn { color:var(--accent-warning); }
+.reaction-picker { display:flex; gap:4px; flex-wrap:wrap; margin-top:8px; }
+.emoji-btn { background:var(--bg-tertiary); border:1px solid var(--border-color); font-size:18px; padding:4px 8px; }
+.tally { margin-top:10px; }
+.tally-bar { display:flex; height:8px; border-radius:4px; overflow:hidden; background:var(--bg-tertiary); margin-bottom:4px; }
+.tally-approve { background:var(--accent-success); } .tally-reject { background:var(--accent-error); } .tally-abstain { background:var(--accent-warning); }
+.messages-list.tall { max-height:560px; }
+.mono { font-family:'SF Mono',Monaco,'Cascadia Code',monospace; font-size:12px; }
+.detail-pre { white-space:pre-wrap; word-break:break-word; margin-top:12px; color:var(--text-secondary); }
+select { margin-bottom:0; }
+.agent-registration select, .message-form select { margin-bottom:12px; }

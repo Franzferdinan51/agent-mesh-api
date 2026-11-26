@@ -11,6 +11,7 @@ import { v4 as uuidv4 } from 'uuid';
 import sqlite3 from 'sqlite3';
 import { open } from 'sqlite';
 import http from 'http';
+import crypto from 'crypto';
 import { existsSync, readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -22,7 +23,35 @@ const APP_VERSION = JSON.parse(readFileSync(join(__dirname, 'package.json'), 'ut
 
 const app = express();
 const PORT = process.env.PORT || 4000;
-const API_KEY = process.env.AGENT_MESH_API_KEY || 'openclaw-mesh-default-key';
+const DEFAULT_API_KEY = 'openclaw-mesh-default-key';
+const API_KEY = process.env.AGENT_MESH_API_KEY || DEFAULT_API_KEY;
+const USING_DEFAULT_API_KEY = API_KEY === DEFAULT_API_KEY;
+// v4.3: rate limiting (in-memory, per API-key + IP)
+const RATE_LIMIT_MAX = toPositiveIntEnv(process.env.AGENT_MESH_RATE_LIMIT_MAX, 300);
+const RATE_LIMIT_WINDOW_MS = toPositiveIntEnv(process.env.AGENT_MESH_RATE_LIMIT_WINDOW_MS, 60000);
+// v4.3: structured logging — 'json' | 'pretty' | 'off' (default: errors JSON-logged, no access log)
+const LOG_FORMAT = (process.env.AGENT_MESH_LOG_FORMAT || 'default').toLowerCase();
+
+function toPositiveIntEnv(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function sha256Hex(value) {
+  return crypto.createHash('sha256').update(String(value), 'utf8').digest('hex');
+}
+
+// Constant-time string comparison (via fixed-length digests so length never leaks)
+function timingSafeStringEqual(a, b) {
+  const da = crypto.createHash('sha256').update(String(a), 'utf8').digest();
+  const db = crypto.createHash('sha256').update(String(b), 'utf8').digest();
+  return crypto.timingSafeEqual(da, db);
+}
+
+function logJson(level, fields) {
+  const line = JSON.stringify({ ts: new Date().toISOString(), level, ...fields });
+  if (level === 'error') console.error(line); else console.log(line);
+}
 const DB_PATH = process.env.AGENT_MESH_DB_PATH || join(__dirname, 'agent-mesh.db');
 const BODY_LIMIT = process.env.AGENT_MESH_BODY_LIMIT || '12mb';
 const OFFLINE_THRESHOLD_MINUTES = parseInt(process.env.AGENT_MESH_OFFLINE_MINUTES || '5', 10);
@@ -34,8 +63,72 @@ const VALID_MESSAGE_STATUSES = ['pending', 'delivered', 'processing', 'completed
 const VALID_HEALTH_STATUSES = ['healthy', 'degraded', 'unhealthy', 'offline'];
 
 // Middleware
+// v4.3: request IDs — propagate a caller-supplied X-Request-Id or mint one
+app.use((req, res, next) => {
+  req.requestId = req.headers['x-request-id'] || crypto.randomUUID();
+  res.set('X-Request-Id', req.requestId);
+  next();
+});
+
+// v4.3: security headers (hand-rolled — the set is small and fixed, so no helmet
+// dependency is justified). CSP note: the server also serves the built Web UI
+// statically; its JS/CSS are external files (default-src 'self' is safe), but the
+// console lets the user point it at an arbitrary mesh URL, so connect-src is
+// deliberately widened to http/https/ws/wss — see MODERNIZATION.md / report.
+app.use((req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('X-Frame-Options', 'DENY');
+  res.set('Referrer-Policy', 'no-referrer');
+  res.set('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss: http: https:; frame-ancestors 'none'; base-uri 'self'");
+  next();
+});
+
+// v4.3: access logging (JSON when AGENT_MESH_LOG_FORMAT=json, human line when pretty)
+app.use((req, res, next) => {
+  if (LOG_FORMAT === 'json' || LOG_FORMAT === 'pretty') {
+    const started = Date.now();
+    res.on('finish', () => {
+      if (LOG_FORMAT === 'json') {
+        logJson('info', { type: 'access', reqId: req.requestId, method: req.method, path: req.originalUrl, status: res.statusCode, ms: Date.now() - started });
+      } else {
+        console.log(`[HTTP] ${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - started}ms reqId=${req.requestId}`);
+      }
+    });
+  }
+  next();
+});
+
 app.use(cors());
 app.use(express.json({ limit: BODY_LIMIT }));
+
+// v4.3: in-memory rate limiter for /api/* and /a2a* (per presented-key + IP).
+// /health and /ready are not under those mounts, so they stay exempt.
+const rateBuckets = new Map();
+function rateLimiter(req, res, next) {
+  const presented = req.headers['x-api-key']
+    || (req.headers['authorization']?.startsWith('Bearer ') ? req.headers['authorization'].substring(7) : null)
+    || req.query.apiKey || 'anonymous';
+  const bucketKey = `${sha256Hex(presented).slice(0, 16)}|${req.ip || req.socket?.remoteAddress || 'unknown'}`;
+  const now = Date.now();
+  let bucket = rateBuckets.get(bucketKey);
+  if (!bucket || now - bucket.windowStart >= RATE_LIMIT_WINDOW_MS) {
+    bucket = { windowStart: now, count: 0 };
+    rateBuckets.set(bucketKey, bucket);
+  }
+  bucket.count += 1;
+  if (rateBuckets.size > 10000) { // opportunistic prune of expired buckets
+    for (const [k, b] of rateBuckets) if (now - b.windowStart >= RATE_LIMIT_WINDOW_MS) rateBuckets.delete(k);
+  }
+  if (bucket.count > RATE_LIMIT_MAX) {
+    const retryAfter = Math.max(1, Math.ceil((bucket.windowStart + RATE_LIMIT_WINDOW_MS - now) / 1000));
+    res.set('Retry-After', String(retryAfter));
+    if (LOG_FORMAT !== 'off') logJson('warn', { type: 'rate_limit', reqId: req.requestId, method: req.method, path: req.originalUrl, status: 429 });
+    return res.status(429).json({ error: 'Too many requests', retryAfter });
+  }
+  next();
+}
+app.use('/api', rateLimiter);
+app.use('/a2a', rateLimiter);
 
 function parseJson(value, fallback) {
   try {
@@ -348,7 +441,50 @@ async function initDb() {
       created_at TEXT DEFAULT (datetime('now')),
       UNIQUE(decision_id, agent_id)
     );
+
+    -- v4.3: API keys hashed at rest. key_hash holds sha256(key); key_value is a
+    -- legacy plaintext column kept ONLY so pre-4.3 rows can be transparently
+    -- upgraded (nulled) on their first successful authentication.
+    CREATE TABLE IF NOT EXISTS agent_api_keys (
+      id TEXT PRIMARY KEY,
+      name TEXT,
+      key_hash TEXT,
+      key_value TEXT,
+      key_prefix TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      last_used_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON agent_api_keys(key_hash);
+
+    -- v4.3: persisted A2A tasks (see /a2a endpoints)
+    CREATE TABLE IF NOT EXISTS a2a_tasks (
+      id TEXT PRIMARY KEY,
+      context_id TEXT,
+      state TEXT,
+      task_json TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
   `);
+
+  // v4.3: seed the config/env key into the key store, hashed only. Any legacy
+  // plaintext row for the same key is left in place and upgraded on first use.
+  try {
+    const configHash = sha256Hex(API_KEY);
+    const existing = await db.get(
+      'SELECT id FROM agent_api_keys WHERE key_hash = ? OR key_value = ? LIMIT 1',
+      [configHash, API_KEY]
+    );
+    if (!existing) {
+      await db.run(
+        'INSERT INTO agent_api_keys (id, name, key_hash, key_value, key_prefix) VALUES (?, ?, ?, NULL, ?)',
+        [uuidv4(), 'config', configHash, API_KEY.slice(0, 8)]
+      );
+      console.log('[DB] Config API key recorded as sha256 hash (no plaintext stored)');
+    }
+  } catch (e) {
+    console.error('[DB] API key seed failed:', e.message);
+  }
 
   // v4.0: Add thread_id and intent columns if messages table already exists
   try { await db.exec(`ALTER TABLE messages ADD COLUMN thread_id TEXT`); } catch (e) { /* ignore if exists */ }
@@ -500,27 +636,106 @@ async function initDb() {
   }
 }
 
-// Auth middleware
-function requireApiKey(req, res, next) {
-  // Try multiple sources for the API key (header, query param, Authorization Bearer token)
+// Auth middleware (v4.3: keys are verified against sha256 hashes at rest;
+// legacy plaintext rows in agent_api_keys are transparently upgraded on use)
+function extractApiKey(req) {
   let key = req.headers['x-api-key'] || req.query.apiKey;
-
-  // Also support Authorization: Bearer <token> header
   const authHeader = req.headers['authorization'];
   if (authHeader && authHeader.startsWith('Bearer ')) {
     key = authHeader.substring(7);
   }
-
-  // Trim whitespace and validate
-  if (!key || key.trim() !== API_KEY) {
-    return res.status(401).json({
-      error: 'Invalid or missing API key',
-      received: key ? `${key.substring(0, 3)}...` : 'none'
-    });
-  }
-
-  next();
+  return key ? String(key).trim() : null;
 }
+
+async function validateApiKey(candidate) {
+  if (!candidate) return false;
+  // Config/env key (includes the well-known default) — constant-time compare.
+  if (timingSafeStringEqual(candidate, API_KEY)) return true;
+  if (!db) return false;
+  const candidateHash = sha256Hex(candidate);
+  try {
+    const hashed = await db.get('SELECT id FROM agent_api_keys WHERE key_hash = ? LIMIT 1', [candidateHash]);
+    if (hashed) {
+      await db.run('UPDATE agent_api_keys SET last_used_at = datetime(\'now\') WHERE id = ?', [hashed.id]);
+      return true;
+    }
+    // Legacy plaintext row: on a successful match, upgrade it to a hash in place.
+    const rows = await db.all('SELECT id, key_value FROM agent_api_keys WHERE key_value IS NOT NULL');
+    for (const row of rows) {
+      if (row.key_value && timingSafeStringEqual(candidate, row.key_value)) {
+        await db.run(
+          'UPDATE agent_api_keys SET key_hash = ?, key_value = NULL, key_prefix = ?, last_used_at = datetime(\'now\') WHERE id = ?',
+          [candidateHash, candidate.slice(0, 8), row.id]
+        );
+        console.log(`[Auth] Upgraded legacy plaintext API key (id=${row.id}) to sha256 hash`);
+        return true;
+      }
+    }
+  } catch (e) {
+    console.error('[Auth] Key lookup failed:', e.message);
+  }
+  return false;
+}
+
+async function requireApiKey(req, res, next) {
+  try {
+    const key = extractApiKey(req);
+    if (!key || !(await validateApiKey(key))) {
+      if (LOG_FORMAT !== 'off') logJson('warn', { type: 'auth_failure', reqId: req.requestId, method: req.method, path: req.originalUrl, status: 401 });
+      return res.status(401).json({
+        error: 'Invalid or missing API key',
+        received: key ? `${key.substring(0, 3)}...` : 'none'
+      });
+    }
+    req.apiKeyPrefix = key.slice(0, 8);
+    next();
+  } catch (error) {
+    next(error);
+  }
+}
+
+// === API KEY MANAGEMENT (v4.3) ===
+// Create a new API key. The plaintext is returned exactly once; only its
+// sha256 hash is stored.
+app.post('/api/keys', requireApiKey, async (req, res) => {
+  try {
+    const name = (req.body?.name || 'unnamed').toString().slice(0, 100);
+    const plain = `mesh_${crypto.randomBytes(24).toString('hex')}`;
+    const id = uuidv4();
+    await db.run(
+      'INSERT INTO agent_api_keys (id, name, key_hash, key_value, key_prefix) VALUES (?, ?, ?, NULL, ?)',
+      [id, name, sha256Hex(plain), plain.slice(0, 8)]
+    );
+    res.json({ success: true, id, name, apiKey: plain, keyPrefix: plain.slice(0, 8) });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// List keys (metadata only — never hashes or plaintext)
+app.get('/api/keys', requireApiKey, async (req, res) => {
+  try {
+    const rows = await db.all('SELECT id, name, key_prefix, created_at, last_used_at FROM agent_api_keys ORDER BY created_at ASC');
+    res.json(rows.map(r => ({ id: r.id, name: r.name, keyPrefix: r.key_prefix, createdAt: r.created_at, lastUsedAt: r.last_used_at })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Revoke a key created via the API (the config/env key cannot be revoked here)
+app.delete('/api/keys/:id', requireApiKey, async (req, res) => {
+  try {
+    const row = await db.get('SELECT * FROM agent_api_keys WHERE id = ?', [req.params.id]);
+    if (!row) return res.status(404).json({ error: 'API key not found' });
+    if (row.key_hash && timingSafeStringEqual(row.key_hash, sha256Hex(API_KEY))) {
+      return res.status(400).json({ error: 'The config/env API key cannot be revoked via the API' });
+    }
+    await db.run('DELETE FROM agent_api_keys WHERE id = ?', [req.params.id]);
+    res.json({ success: true, id: req.params.id, revoked: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // === AGENT REGISTRY ===
 
@@ -3176,6 +3391,315 @@ app.get('/health', (req, res) => {
   });
 });
 
+// === v4.3: READINESS ===
+// Unauthenticated like /health, but checks real dependencies.
+app.get('/ready', async (req, res) => {
+  const checks = {};
+  let ok = true;
+  try {
+    const row = await db.get('SELECT 1 as ok');
+    checks.database = row?.ok === 1 ? 'ok' : 'fail';
+    if (row?.ok !== 1) ok = false;
+  } catch (e) {
+    checks.database = `fail: ${e.message}`;
+    ok = false;
+  }
+  try {
+    // BEGIN IMMEDIATE takes the write lock without changing any data —
+    // it proves the DB file is writable, then rolls straight back.
+    await db.run('BEGIN IMMEDIATE');
+    await db.run('ROLLBACK');
+    checks.databaseWritable = 'ok';
+  } catch (e) {
+    checks.databaseWritable = `fail: ${e.message}`;
+    ok = false;
+  }
+  const lagStart = Date.now();
+  await new Promise(resolve => setImmediate(resolve));
+  const lagMs = Date.now() - lagStart;
+  checks.eventLoop = lagMs < 1000 ? 'ok' : `slow: ${lagMs}ms`;
+  if (lagMs >= 1000) ok = false;
+  res.status(ok ? 200 : 503).json({ status: ok ? 'ready' : 'not_ready', checks, timestamp: new Date().toISOString() });
+});
+
+// === v4.3: ROUTE INVENTORY + OPENAPI 3.1 ===
+// The spec is generated by walking the live Express router stack, so it can
+// never drift from the routes the server actually registered.
+function getRouteInventory() {
+  const routes = [];
+  const stack = (app.router || app._router)?.stack || [];
+  const walk = (layers, prefix) => {
+    for (const layer of layers) {
+      if (layer.route) {
+        for (const method of Object.keys(layer.route.methods)) {
+          if (layer.route.methods[method]) routes.push({ method: method.toUpperCase(), path: prefix + layer.route.path });
+        }
+      } else if (layer.handle?.stack) {
+        walk(layer.handle.stack, prefix);
+      }
+    }
+  };
+  walk(stack, '');
+  const seen = new Set();
+  return routes.filter(r => {
+    const k = `${r.method} ${r.path}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+function toOpenApiPath(p) {
+  return p.replace(/:([A-Za-z0-9_]+)/g, '{$1}');
+}
+
+function buildOpenApiSpec(req) {
+  const base = `${req.protocol}://${req.get('host')}`;
+  const paths = {};
+  for (const { method, path } of getRouteInventory()) {
+    const oaPath = toOpenApiPath(path);
+    const params = [...path.matchAll(/:([A-Za-z0-9_]+)/g)].map(m => ({
+      name: m[1], in: 'path', required: true, schema: { type: 'string' }
+    }));
+    const secured = path.startsWith('/api') || path.startsWith('/a2a');
+    const operation = {
+      operationId: `${method.toLowerCase()}_${oaPath.replace(/[^A-Za-z0-9]+/g, '_')}`,
+      summary: `${method} ${path}`,
+      responses: {
+        '200': { description: 'OK' },
+        ...(secured ? { '401': { description: 'Invalid or missing API key' } } : {}),
+        '429': { description: 'Rate limited' },
+        '500': { description: 'Server error' }
+      }
+    };
+    if (params.length) operation.parameters = params;
+    if (secured) operation.security = [{ meshApiKey: [] }];
+    if (['POST', 'PUT', 'PATCH'].includes(method)) {
+      operation.requestBody = { content: { 'application/json': { schema: { type: 'object' } } } };
+    }
+    paths[oaPath] = paths[oaPath] || {};
+    paths[oaPath][method.toLowerCase()] = operation;
+  }
+  return {
+    openapi: '3.1.0',
+    info: { title: 'Agent Mesh API', version: APP_VERSION, description: 'Agent-to-agent communication mesh: registry, messaging, groups, shared memory, decisions, tasks, plus an A2A 1.0 / 0.3 interface.' },
+    servers: [{ url: base }],
+    paths,
+    components: {
+      securitySchemes: {
+        meshApiKey: { type: 'apiKey', in: 'header', name: 'X-API-Key' }
+      }
+    }
+  };
+}
+
+app.get('/openapi.json', (req, res) => {
+  res.json(buildOpenApiSpec(req));
+});
+
+// Key-gated route dump — used by the OpenAPI honesty test in test-v43.js
+app.get('/api/debug/routes', requireApiKey, (req, res) => {
+  const routes = getRouteInventory();
+  res.json({ count: routes.length, routes });
+});
+
+// === v4.3: A2A (Agent2Agent) SURFACE ===
+// Primary profile: A2A 1.0 (SendMessage / GetTask) at POST /a2a.
+// Compatibility profile: A2A 0.3 (message/send / tasks/get) at POST /a2a/v0.3.
+// Both are thin adapters over the same core (a2aDeliver + persisted tasks).
+const A2A_SKILLS = [
+  { id: 'agent-messaging', name: 'Agent messaging', description: 'Deliver a text message to a named registered agent (or broadcast to the whole mesh when no target is named) and return a completed A2A task.', tags: ['messaging', 'routing'], examples: ['Send "summarize the grow log" to Hermes'], inputModes: ['text/plain', 'application/json'], outputModes: ['text/plain', 'application/json'] },
+  { id: 'group-broadcast', name: 'Group broadcast', description: 'Broadcast a message to every agent in the mesh or to the members of a group via the mesh broadcast endpoints.', tags: ['messaging', 'broadcast'], examples: ['Broadcast "standup in 5 minutes" to all agents'] },
+  { id: 'shared-memory', name: 'Shared memory', description: 'Store and retrieve versioned key-value entries in a group\'s collective memory.', tags: ['memory', 'groups'], examples: ['Remember the deployment checklist for the ops group'] },
+  { id: 'decision-voting', name: 'Decision voting', description: 'Propose decisions to a group and collect approve/reject/abstain votes with a derived outcome.', tags: ['decisions', 'voting'], examples: ['Propose shipping v4.3 today and open the vote'] },
+  { id: 'agent-discovery', name: 'Agent discovery', description: 'List the agents registered in the mesh with their capabilities and presence.', tags: ['discovery', 'registry'], examples: ['Which agents are online?'] }
+];
+
+function buildAgentCard(req) {
+  const base = `${req.protocol}://${req.get('host')}`;
+  return {
+    name: 'Agent Mesh',
+    description: 'Registry, routing and messaging hub for local agents: discover agents, send messages, broadcast to groups, share memory and run decision votes.',
+    supportedInterfaces: [
+      { url: `${base}/a2a`, protocolBinding: 'HTTP+JSON', protocolVersion: '1.0' },
+      { url: `${base}/a2a/v0.3`, protocolBinding: 'HTTP+JSON', protocolVersion: '0.3' }
+    ],
+    provider: { organization: 'Agent Mesh', url: base },
+    version: APP_VERSION,
+    documentationUrl: `${base}/openapi.json`,
+    capabilities: { streaming: false, pushNotifications: false, extendedAgentCard: false },
+    securitySchemes: {
+      meshApiKey: { apiKeySecurityScheme: { description: 'Agent Mesh API key', location: 'header', name: 'X-API-Key' } }
+    },
+    securityRequirements: [{ schemes: { meshApiKey: { list: [] } } }],
+    defaultInputModes: ['text/plain', 'application/json'],
+    defaultOutputModes: ['text/plain', 'application/json'],
+    skills: A2A_SKILLS
+  };
+}
+
+app.get('/.well-known/agent-card.json', (req, res) => {
+  res.set('Cache-Control', 'max-age=300');
+  res.json(buildAgentCard(req));
+});
+
+// Core delivery shared by both A2A profiles. Creates real mesh message rows
+// (sender recorded as the gateway identity 'a2a-gateway') and broadcasts the
+// same WebSocket events the REST message endpoints use.
+async function a2aDeliver({ text, toAgentRef, messageId, contextId }) {
+  const taskId = uuidv4();
+  const ctx = contextId || uuidv4();
+  const now = new Date().toISOString();
+  const recipients = [];
+  if (toAgentRef) {
+    const target = await requireAgent(toAgentRef, 'target agent');
+    const mid = uuidv4();
+    await db.run(
+      'INSERT INTO messages (id, from_agent, to_agent, content, message_type, timeout_ms) VALUES (?, ?, ?, ?, ?, ?)',
+      [mid, 'a2a-gateway', target.id, text, 'direct', DEFAULT_MESSAGE_TIMEOUT_MS]
+    );
+    recipients.push({ id: target.id, name: target.name, messageId: mid });
+    broadcast({ type: 'new_message', message: { id: mid, from: 'a2a-gateway', fromName: 'a2a-gateway', to: target.id, toName: target.name, content: text, messageType: 'direct', createdAt: now } });
+  } else {
+    const agents = await db.all('SELECT id, name FROM agents');
+    for (const agent of agents) {
+      const mid = uuidv4();
+      await db.run(
+        'INSERT INTO messages (id, from_agent, to_agent, content, message_type, timeout_ms) VALUES (?, ?, ?, ?, ?, ?)',
+        [mid, 'a2a-gateway', agent.id, text, 'broadcast', DEFAULT_MESSAGE_TIMEOUT_MS]
+      );
+      recipients.push({ id: agent.id, name: agent.name, messageId: mid });
+    }
+    broadcast({ type: 'broadcast', from: 'a2a-gateway', fromName: 'a2a-gateway', content: text, recipientCount: recipients.length });
+  }
+  const task = {
+    id: taskId,
+    contextId: ctx,
+    status: { state: 'TASK_STATE_COMPLETED', timestamp: now },
+    history: [{
+      messageId: messageId || uuidv4(),
+      role: 'ROLE_USER',
+      parts: [{ text, mediaType: 'text/plain' }],
+      ...(toAgentRef ? { metadata: { toAgent: toAgentRef } } : {})
+    }],
+    artifacts: [{
+      artifactId: uuidv4(),
+      name: 'delivery',
+      parts: [{ text: recipients.length ? `Delivered to ${recipients.map(r => r.name).join(', ')}` : 'Delivered (no registered recipients)', mediaType: 'text/plain' }],
+      metadata: { recipients }
+    }],
+    metadata: { messageIds: recipients.map(r => r.messageId) }
+  };
+  await db.run(
+    'INSERT INTO a2a_tasks (id, context_id, state, task_json) VALUES (?, ?, ?, ?)',
+    [task.id, task.contextId, task.status.state, JSON.stringify(task)]
+  );
+  return task;
+}
+
+async function a2aGetTask(id) {
+  const row = await db.get('SELECT task_json FROM a2a_tasks WHERE id = ?', [id]);
+  return row ? JSON.parse(row.task_json) : null;
+}
+
+function a2aTaskTo03(task) {
+  const convPart = p => (typeof p.text === 'string' ? { kind: 'text', text: p.text } : { kind: 'data', data: p.data ?? null });
+  return {
+    id: task.id,
+    contextId: task.contextId,
+    status: { state: 'completed', timestamp: task.status?.timestamp },
+    history: (task.history || []).map(m => ({
+      messageId: m.messageId,
+      role: 'user',
+      parts: (m.parts || []).map(convPart),
+      ...(m.metadata ? { metadata: m.metadata } : {}),
+      kind: 'message'
+    })),
+    artifacts: (task.artifacts || []).map(a => ({
+      artifactId: a.artifactId,
+      name: a.name,
+      parts: (a.parts || []).map(convPart)
+    })),
+    kind: 'task'
+  };
+}
+
+function rpcError(id, code, message, data) {
+  return { jsonrpc: '2.0', id: id ?? null, error: data ? { code, message, data } : { code, message } };
+}
+
+function extractA2aTextAndTarget(params, profile) {
+  const message = params?.message;
+  if (!message || !Array.isArray(message.parts)) return { error: 'params.message with a parts array is required' };
+  let text = null;
+  for (const part of message.parts) {
+    if (typeof part?.text === 'string') { text = part.text; break; }
+  }
+  if (!text) return { error: 'a text part is required' };
+  const toAgent = message.metadata?.toAgent || params.configuration?.toAgent || params.metadata?.toAgent || null;
+  return { text, toAgent, messageId: message.messageId || null, contextId: message.contextId || null };
+}
+
+app.post('/a2a', requireApiKey, async (req, res) => {
+  const { id, method, params } = req.body || {};
+  try {
+    if (!method) return res.json(rpcError(id, -32600, 'Invalid Request: method is required'));
+    if (method === 'SendMessage') {
+      const parsed = extractA2aTextAndTarget(params, '1.0');
+      if (parsed.error) return res.json(rpcError(id, -32602, parsed.error));
+      let task;
+      try {
+        task = await a2aDeliver(parsed);
+      } catch (e) {
+        if (e.statusCode === 404) return res.json(rpcError(id, -32602, e.message));
+        throw e;
+      }
+      return res.json({ jsonrpc: '2.0', id: id ?? null, result: { task } });
+    }
+    if (method === 'GetTask') {
+      const taskId = params?.id;
+      if (!taskId) return res.json(rpcError(id, -32602, 'params.id is required'));
+      const task = await a2aGetTask(taskId);
+      if (!task) return res.json(rpcError(id, -32001, 'Task not found', [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'TASK_NOT_FOUND' }]));
+      return res.json({ jsonrpc: '2.0', id: id ?? null, result: { task } });
+    }
+    return res.json(rpcError(id, -32601, `Method not found: ${method}`));
+  } catch (error) {
+    console.error('[A2A] Error:', error);
+    return res.json(rpcError(id, -32603, error.message));
+  }
+});
+
+app.post('/a2a/v0.3', requireApiKey, async (req, res) => {
+  const { id, method, params } = req.body || {};
+  try {
+    if (!method) return res.json(rpcError(id, -32600, 'Invalid Request: method is required'));
+    if (method === 'message/send') {
+      const parsed = extractA2aTextAndTarget(params, '0.3');
+      if (parsed.error) return res.json(rpcError(id, -32602, parsed.error));
+      let task;
+      try {
+        task = await a2aDeliver(parsed);
+      } catch (e) {
+        if (e.statusCode === 404) return res.json(rpcError(id, -32602, e.message));
+        throw e;
+      }
+      return res.json({ jsonrpc: '2.0', id: id ?? null, result: a2aTaskTo03(task) });
+    }
+    if (method === 'tasks/get') {
+      const taskId = params?.id;
+      if (!taskId) return res.json(rpcError(id, -32602, 'params.id is required'));
+      const task = await a2aGetTask(taskId);
+      if (!task) return res.json(rpcError(id, -32001, 'Task not found'));
+      return res.json({ jsonrpc: '2.0', id: id ?? null, result: a2aTaskTo03(task) });
+    }
+    return res.json(rpcError(id, -32601, `Method not found: ${method}`));
+  } catch (error) {
+    console.error('[A2A] Error:', error);
+    return res.json(rpcError(id, -32603, error.message));
+  }
+});
+
 // OpenClaw-friendly health summary alias
 app.get('/api/health', requireApiKey, async (req, res) => {
   try {
@@ -3297,6 +3821,15 @@ app.get('/api/phantom/info', requireApiKey, async (req, res) => {
   }
 });
 
+// v4.3: final error handler — errors are always JSON-logged (unless logging is
+// off) and answered with the standard {error} JSON shape instead of Express's
+// default HTML error page.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  if (LOG_FORMAT !== 'off') logJson('error', { type: 'error', reqId: req.requestId, method: req.method, path: req.originalUrl, status: err.status || err.statusCode || 500, error: err.message });
+  if (!res.headersSent) res.status(err.status || err.statusCode || 500).json({ error: err.message });
+});
+
 // === WEBSOCKET ===
 
 const server = http.createServer(app);
@@ -3358,7 +3891,16 @@ wss.on('connection', (ws, req) => {
 // Start server
 async function start() {
   await initDb();
-  
+
+  if (USING_DEFAULT_API_KEY) {
+    console.warn('╔══════════════════════════════════════════════════════════╗');
+    console.warn('║  ⚠️  WARNING: using the DEFAULT API key                  ║');
+    console.warn('║  "openclaw-mesh-default-key" is public and known to      ║');
+    console.warn('║  anyone who has read this repo. Set AGENT_MESH_API_KEY   ║');
+    console.warn('║  to your own secret before any real deployment.          ║');
+    console.warn('╚══════════════════════════════════════════════════════════╝');
+  }
+
   server.listen(PORT, () => {
     console.log(`
 ╔══════════════════════════════════════════════════════════╗

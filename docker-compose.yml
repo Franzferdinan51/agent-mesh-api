@@ -1,0 +1,51 @@
+# Agent Mesh API — single-service Compose stack (v4.3.0)
+#
+#   docker compose up -d --build
+#   curl http://localhost:4000/health
+#
+# Set a real API key before exposing this beyond a trusted network:
+#   AGENT_MESH_API_KEY=<your-secret> docker compose up -d
+# (or put AGENT_MESH_API_KEY in a local .env file next to this file —
+# Compose reads it automatically. Never commit a real key.)
+
+services:
+  agent-mesh:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: agent-mesh-api:4.3.0
+    container_name: agent-mesh-api
+    restart: unless-stopped
+    ports:
+      # Host port is overridable: PORT=8080 docker compose up -d
+      - "${PORT:-4000}:4000"
+    environment:
+      # Container-side port stays 4000 (matches Dockerfile EXPOSE/HEALTHCHECK).
+      PORT: "4000"
+      # Shared API key for all /api routes (server.js: AGENT_MESH_API_KEY).
+      # Defaults to the public dev key from the repo — change it.
+      AGENT_MESH_API_KEY: "${AGENT_MESH_API_KEY:-openclaw-mesh-default-key}"
+      # SQLite DB inside the named volume (server.js: AGENT_MESH_DB_PATH).
+      AGENT_MESH_DB_PATH: "/data/agent-mesh.db"
+      # Optional tuning knobs, all read by server.js (see .env.example):
+      AGENT_MESH_BODY_LIMIT: "${AGENT_MESH_BODY_LIMIT:-12mb}"
+      AGENT_MESH_OFFLINE_MINUTES: "${AGENT_MESH_OFFLINE_MINUTES:-5}"
+      MESSAGE_TIMEOUT: "${MESSAGE_TIMEOUT:-300000}"
+      MESSAGE_TIMEOUT_CHECK_INTERVAL_MS: "${MESSAGE_TIMEOUT_CHECK_INTERVAL_MS:-60000}"
+      SCHEDULED_MESSAGE_CHECK_INTERVAL_MS: "${SCHEDULED_MESSAGE_CHECK_INTERVAL_MS:-15000}"
+    volumes:
+      - mesh-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:4000/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  mesh-data:
+    name: agent-mesh-data

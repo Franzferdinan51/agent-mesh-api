@@ -20,6 +20,8 @@ pip install -r requirements.txt
 
 Pinned in `requirements.txt`: `fastmcp==4.2.6`, `httpx==0.28.1`
 (verified: the server starts and answers `tools/list` with these versions).
+No extra dependency is needed for the Streamable HTTP transport — FastMCP
+4.2.6 already brings in `uvicorn`/`starlette` for it.
 
 ## Environment
 
@@ -29,11 +31,61 @@ export AGENT_MESH_KEY="openclaw-mesh-default-key"
 export AGENT_MESH_SENDER="OpenClaw-MCP"
 ```
 
+Transport selection (HTTP mode only — stdio needs none of these):
+
+```bash
+export MCP_TRANSPORT="stdio"            # stdio (default) | streamable-http
+export MCP_HOST="127.0.0.1"             # HTTP bind host
+export MCP_PORT="8765"                  # HTTP bind port
+export MCP_PATH="/mcp"                  # HTTP endpoint path
+```
+
 ## Run
+
+stdio (default — unchanged behavior, for OpenClaw / Claude Desktop style clients):
 
 ```bash
 python server.py
 ```
+
+### Streamable HTTP (optional)
+
+The server can also serve over Streamable HTTP, the current MCP spec
+transport for remote clients. stdio stays the default; HTTP is opt-in via
+flag or env var (the CLI flag wins):
+
+```bash
+python server.py --transport streamable-http
+# or equivalently:
+MCP_TRANSPORT=streamable-http python server.py
+# bind/path overrides (flag or env): --host --port --path / MCP_HOST MCP_PORT MCP_PATH
+python server.py --transport streamable-http --host 127.0.0.1 --port 8765 --path /mcp
+```
+
+Endpoint: `http://127.0.0.1:8765/mcp` (with the defaults above). The HTTP
+transport runs stateless (`stateless_http=True`) — every tool is a stateless
+proxy call to the mesh REST API, so no MCP session needs to be kept between
+requests. Responses are SSE-framed (`event: message` / `data: {...}` lines).
+
+curl smoke test (server running, mesh REST backend not required for these):
+
+```bash
+curl -X POST http://127.0.0.1:8765/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl-smoke","version":"0"}}}'
+
+curl -X POST http://127.0.0.1:8765/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+```
+
+The `tools/list` call returns the same 16 tools as stdio.
+
+> **Security:** the HTTP transport has no built-in authentication — do not
+> expose it raw to the internet. Keep it on localhost / a trusted network, or
+> put it behind a proxy that enforces the mesh API key (`AGENT_MESH_KEY`).
 
 ## Tools (16)
 

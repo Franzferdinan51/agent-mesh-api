@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api:
+    name: API tests (test-api.js + test-v4.js)
+    runs-on: ubuntu-latest
+    env:
+      # Scratch port + temp DB so CI never touches a real database.
+      TEST_PORT: "4123"
+      API_URL: http://127.0.0.1:4123
+      AGENT_MESH_API_KEY: ci-test-key
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Node.js 24 LTS
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Boot server on scratch port with temp DB
+        env:
+          PORT: ${{ env.TEST_PORT }}
+          AGENT_MESH_DB_PATH: ${{ runner.temp }}/agent-mesh-ci.db
+        run: |
+          node server.js > "$RUNNER_TEMP/server.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/server.pid"
+
+      - name: Wait for /health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS "$API_URL/health" > /dev/null 2>&1; then
+              echo "Server is healthy after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server did not become healthy in 30s — log follows:"
+          cat "$RUNNER_TEMP/server.log" || true
+          exit 1
+
+      - name: Run test-api.js
+        run: node test-api.js
+
+      - name: Run test-v4.js
+        run: node test-v4.js
+
+      - name: Show server log on failure
+        if: failure()
+        run: cat "$RUNNER_TEMP/server.log" || true
+
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/server.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/server.pid")" || true
+          fi
+
+  webui:
+    name: Web UI build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: webui
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Node.js 24 LTS
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Web UI
+        run: npm run build

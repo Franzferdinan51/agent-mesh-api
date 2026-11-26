@@ -366,5 +366,41 @@ async def phantom_seed(filepath: str) -> str:
 
 
 
+def main() -> None:
+    """Run the MCP server.
+
+    stdio is the default and is unchanged when no flag/env is given.
+    Streamable HTTP (current MCP spec transport) is opt-in via
+    --transport streamable-http or MCP_TRANSPORT=streamable-http.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Agent Mesh MCP Server")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "streamable-http"],
+        default=None,
+        help="Transport to serve on (default: $MCP_TRANSPORT or stdio)",
+    )
+    parser.add_argument("--host", default=None, help="HTTP bind host (default: $MCP_HOST or 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=None, help="HTTP bind port (default: $MCP_PORT or 8765)")
+    parser.add_argument("--path", default=None, help="HTTP endpoint path (default: $MCP_PATH or /mcp)")
+    args = parser.parse_args()
+
+    transport = args.transport or os.environ.get("MCP_TRANSPORT", "stdio")
+    if transport == "stdio":
+        mcp.run()
+        return
+    if transport != "streamable-http":
+        parser.error(f"unsupported transport: {transport!r} (expected 'stdio' or 'streamable-http')")
+
+    host = args.host or os.environ.get("MCP_HOST", "127.0.0.1")
+    port = args.port if args.port is not None else int(os.environ.get("MCP_PORT", "8765"))
+    path = args.path or os.environ.get("MCP_PATH", "/mcp")
+    # Stateless: every tool here is a stateless proxy call to the mesh REST
+    # API, so no MCP session state needs to be kept between HTTP requests.
+    mcp.run(transport="streamable-http", host=host, port=port, path=path, stateless_http=True)
+
+
 if __name__ == "__main__":
-    mcp.run()
+    main()

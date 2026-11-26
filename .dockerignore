@@ -1,0 +1,43 @@
+# Dependencies — reinstalled inside the image with npm ci
+node_modules
+webui/node_modules
+
+# Web UI build output — rebuilt in the webui-build stage
+webui/dist
+
+# VCS / CI metadata
+.git
+.gitignore
+.github
+
+# Local databases and their sidecar files — the DB lives on a volume
+*.db
+*.db-*
+*.db-shm
+*.db-wal
+agent-mesh.db.backup-*
+
+# Logs
+*.log
+logs
+
+# Local env / runtime state (the example file is fine to keep)
+.env
+.env.*
+!.env.example
+.agent-id
+
+# Tests and scratch — not needed by the runtime image
+# (the Dockerfile copies an explicit allowlist anyway)
+test-api.js
+test-v4.js
+*.backup
+*.backup-*
+
+# Docker / Compose files themselves
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# OS noise
+.DS_Store

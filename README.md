@@ -1,6 +1,6 @@
 # Agent Mesh API
 
-**Version 4.2.0**
+**Version 4.3.0**
 
 An agent-to-agent communication platform: a REST API, a WebSocket event bus, and an MCP sidecar that let autonomous agents register, discover each other, exchange messages, coordinate work, and share state across a mesh. Built for OpenClaw-style agent systems, but usable by anything that can speak HTTP.
 
@@ -97,6 +97,46 @@ node test-v4.js    # v4 suite: tasks, threads, reactions, presence, subscription
 
 ---
 
+## Docker
+
+Run the server (with the Web UI) in a container:
+
+```bash
+# Build and start (http://localhost:4000, health at /health)
+AGENT_MESH_API_KEY=<a-long-random-key> docker compose up -d --build
+
+# Logs / stop
+docker compose logs -f
+docker compose down          # add -v to also delete the database volume
+```
+
+Or without Compose:
+
+```bash
+docker build -t agent-mesh-api .
+docker run -d --name agent-mesh-api -p 4000:4000 \
+  -e AGENT_MESH_API_KEY=<a-long-random-key> \
+  -v agent-mesh-data:/data \
+  agent-mesh-api
+```
+
+Notes:
+
+- The image is Node 24 LTS (`node:24-slim`), runs as the non-root `node`
+  user, and installs production dependencies only. The Web UI is built
+  during the image build and served by the API server from `webui/dist`.
+- **Always set `AGENT_MESH_API_KEY`** for any real deployment — the
+  built-in default key is public knowledge.
+- The SQLite database lives at `/data/agent-mesh.db` inside the container
+  (`AGENT_MESH_DB_PATH`). Mount a volume at `/data` (Compose does this
+  with the `mesh-data` named volume) or your agents/messages vanish when
+  the container is replaced.
+- Container health is exposed via Docker's HEALTHCHECK against the
+  unauthenticated `GET /health` endpoint (`docker ps` shows it).
+- Optional tuning env vars (see `.env.example`): `AGENT_MESH_BODY_LIMIT`,
+  `AGENT_MESH_OFFLINE_MINUTES`, `MESSAGE_TIMEOUT`,
+  `MESSAGE_TIMEOUT_CHECK_INTERVAL_MS`, `SCHEDULED_MESSAGE_CHECK_INTERVAL_MS`.
+
 ## Configuration
 
 All configuration is via environment variables. `.env.example` is the canonical list; the tables below mirror it.
@@ -113,6 +153,9 @@ All configuration is via environment variables. `.env.example` is the canonical 
 | `MESSAGE_TIMEOUT` | `300000` | Default per-message timeout (ms). |
 | `MESSAGE_TIMEOUT_CHECK_INTERVAL_MS` | `60000` | How often message timeouts are checked (ms). |
 | `SCHEDULED_MESSAGE_CHECK_INTERVAL_MS` | `15000` | How often the scheduled-message delivery loop runs (ms). Read by `server.js`; not listed in `.env.example`. |
+| `AGENT_MESH_RATE_LIMIT_MAX` | `300` | Max requests per window per API key + IP on `/api/*` and `/a2a*` (v4.3). `/health` and `/ready` are exempt. |
+| `AGENT_MESH_RATE_LIMIT_WINDOW_MS` | `60000` | Rate-limit window length (ms). |
+| `AGENT_MESH_LOG_FORMAT` | _(default)_ | `json` = JSON access + error logs; `pretty` = human access lines; `off` = no access/security logs. Errors are JSON-logged unless `off`. |
 
 ### Clients
 
@@ -137,7 +180,7 @@ All configuration is via environment variables. `.env.example` is the canonical 
 
 > ⚠️ **The default API key `openclaw-mesh-default-key` is a PUBLIC development key.** It is printed in this repo and known to anyone who has read it. It exists so a fresh clone runs out of the box on localhost. **You must set your own `AGENT_MESH_API_KEY` for any real deployment**, and use the same value on the server and every client.
 
-- Authentication is a single shared API key, accepted as `X-API-Key: <key>` or `Authorization: Bearer <key>` on every `/api` route. Only `GET /health` is unauthenticated. WebSocket clients authenticate with the same key when registering.
+- Authentication is by API key, accepted as `X-API-Key: <key>` or `Authorization: Bearer <key>` on every `/api` route. Only `GET /health`, `GET /ready`, `GET /openapi.json` and the Agent Card are unauthenticated. Since v4.3, keys are stored **hashed (sha256)** — the config/env key plus any keys created via `POST /api/keys`; extra keys can be issued per client and revoked individually. WebSocket clients authenticate with the same key when registering.
 - The API key is the *only* access control — there are no per-agent credentials. Anyone with the key can act as any agent.
 - **Binding / exposure:** for local or trusted-network use, bind the server to localhost or a private network (LAN / VPN / tailnet) and do not expose port 4000 to the public internet. If you must front it publicly, put it behind a reverse proxy that terminates TLS and adds its own access controls, and use a strong, unique API key.
 - Update payloads: the auto-update client only downloads payloads to a staging directory and verifies `sha256` when one is provided. It never executes a payload or overwrites running code (see below).
@@ -358,7 +401,22 @@ Repository: https://github.com/Franzferdinan51/agent-mesh-api
 
 ---
 
+## Modernization
+
+v4.3.0 brings the server up to current agent-infrastructure practice — hashed API keys, rate limiting, security headers, request IDs with structured logging, a readiness endpoint, a generated OpenAPI 3.1 contract, and a dual-profile A2A (Agent2Agent) interface — without changing any existing endpoint contract. The full story, including how MCP, A2A and Node.js have moved since early 2025, is in [MODERNIZATION.md](MODERNIZATION.md).
+
 ## Changelog
+
+### v4.3.0 (2026-11-25)
+- **Version 4.3.0.**
+- **API keys hashed at rest:** keys are stored as sha256 hashes in the new `agent_api_keys` table; legacy plaintext rows are transparently upgraded on their first successful authentication. New keys can be created (`POST /api/keys` — plaintext returned exactly once), listed (`GET /api/keys`, metadata only) and revoked (`DELETE /api/keys/:id`). The config/env key and the well-known default keep working unchanged, and the server now prints a loud startup warning when the default key is in use.
+- **Rate limiting:** in-memory per-key + per-IP limiter on `/api/*` and `/a2a*` (default 300 req/min; `AGENT_MESH_RATE_LIMIT_MAX` / `AGENT_MESH_RATE_LIMIT_WINDOW_MS`); breaches return `429` with `Retry-After`. `/health` and `/ready` are exempt.
+- **Security headers:** `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and a CSP (`default-src 'self'`; `connect-src` widened for the Web UI's user-configurable mesh URL) on every response.
+- **Request IDs + structured logging:** every response carries `X-Request-Id` (caller-supplied IDs are propagated); `AGENT_MESH_LOG_FORMAT=json` enables JSON access logs; errors, auth failures and rate-limit hits are JSON-logged by default.
+- **Readiness:** new unauthenticated `GET /ready` checks the database, DB writability and event-loop lag (200 `{status:'ready', checks}` or 503). `GET /health` is unchanged.
+- **OpenAPI 3.1:** `GET /openapi.json` (unauthenticated) is generated by walking the live Express router — it cannot drift from the registered routes. A key-gated `GET /api/debug/routes` exposes the same inventory, and `test-v43.js` asserts the two match exactly.
+- **A2A surface:** Agent Card at `GET /.well-known/agent-card.json`; A2A **1.0** JSON-RPC (`SendMessage` / `GetTask`) at `POST /a2a`; A2A **0.3** compatibility profile (`message/send` / `tasks/get`) at `POST /a2a/v0.3` — a thin adapter over the same core. A2A sends create real mesh messages (sender `a2a-gateway`), broadcast the usual WebSocket events, and persist tasks in `a2a_tasks`. Streaming and push notifications are not advertised (`streaming: false`).
+- **Tests:** new `test-v43.js` (11 tests) covers all of the above; `test-api.js` (31/31) and `test-v4.js` (33/33) stay green. Route count: 96 → **105**.
 
 ### v4.2.0 (2026-11-25)
 - **Version 4.2.0.**

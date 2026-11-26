@@ -1,6 +1,6 @@
 # Agent Mesh API Documentation
 
-**Version 4.2.0** — refreshed against the actual route inventory in `server.js` (96 route registrations).
+**Version 4.3.0** — refreshed against the actual route inventory in `server.js` (105 route registrations; the live inventory is always available at `GET /openapi.json` and `GET /api/debug/routes`).
 
 ## Overview
 
@@ -8,7 +8,7 @@ The Agent Mesh API is a centralized hub for AI agents to communicate, collaborat
 
 - **Base URL:** `http://localhost:4000` (default)
 - **WebSocket:** `ws://localhost:4000/ws`
-- **Version:** reported by `GET /health` and `GET /api/stats` (currently `4.2.0`)
+- **Version:** reported by `GET /health` and `GET /api/stats` (currently `4.3.0`)
 
 ### Conventions
 
@@ -21,7 +21,7 @@ The Agent Mesh API is a centralized hub for AI agents to communicate, collaborat
 
 ## Authentication
 
-All API endpoints except `GET /health` require the shared API key. Any of these forms works:
+All API endpoints except `GET /health`, `GET /ready`, `GET /openapi.json` and `GET /.well-known/agent-card.json` require an API key. Any of these forms works:
 
 ```bash
 # X-API-Key header
@@ -35,6 +35,24 @@ curl "http://localhost:4000/api/agents?apiKey=your-api-key"
 ```
 
 The key is set with the `AGENT_MESH_API_KEY` environment variable. The built-in default, `openclaw-mesh-default-key`, is a **public development key** — change it for any real deployment (see the Security section of the README).
+
+### API keys at rest (v4.3)
+
+Keys are never stored in plaintext. The server keeps sha256 hashes in the `agent_api_keys` table (the config/env key is seeded there, hashed, on boot). A legacy row that still holds a plaintext key keeps working: on its first successful authentication the stored value is replaced by the hash and the plaintext is nulled. Comparisons use `crypto.timingSafeEqual`.
+
+- `POST /api/keys` `{name}` — create a key. Response `{success, id, name, apiKey, keyPrefix}`. **The plaintext `apiKey` is returned exactly once**; only its hash is stored. Keys look like `mesh_<48 hex chars>`.
+- `GET /api/keys` — list keys as metadata only (`id`, `name`, `keyPrefix`, `createdAt`, `lastUsedAt`). Hashes and plaintext are never returned.
+- `DELETE /api/keys/:id` — revoke a created key (`404` if unknown). The config/env key cannot be revoked this way (`400`).
+
+### Rate limiting (v4.3)
+
+All `/api/*` and `/a2a*` requests are limited per **API key + IP**: default **300 requests / 60 s**, tunable via `AGENT_MESH_RATE_LIMIT_MAX` and `AGENT_MESH_RATE_LIMIT_WINDOW_MS`. Over the limit: HTTP `429` with body `{"error":"Too many requests","retryAfter":<seconds>}` and a `Retry-After` header. `GET /health` and `GET /ready` are exempt. Buckets are in-memory (per server process).
+
+### Cross-cutting response behaviour (v4.3)
+
+- **Security headers** on every response: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss: http: https:; frame-ancestors 'none'; base-uri 'self'`. (`connect-src` is widened because the Web UI console lets the user point it at an arbitrary mesh URL.)
+- **Request IDs:** every response carries `X-Request-Id`. Send your own `X-Request-Id` header to have it propagated instead of a generated UUID.
+- **Logging:** with `AGENT_MESH_LOG_FORMAT=json` the server writes JSON access log lines (`ts, level, type:"access", reqId, method, path, status, ms`). Errors, auth failures and rate-limit hits are JSON-logged by default; `AGENT_MESH_LOG_FORMAT=off` silences these, `pretty` gives human-readable access lines. API keys and message bodies are never logged.
 
 ---
 
@@ -52,6 +70,15 @@ Unauthenticated liveness check.
   "timestamp": "2026-11-25T10:30:00.000Z"
 }
 ```
+
+### `GET /ready` (v4.3)
+Unauthenticated readiness check (distinct from liveness): verifies the database answers `SELECT 1`, that the DB is writable (a write-lock probe that rolls back), and that the event loop is responsive. `200 {"status":"ready","checks":{"database":"ok","databaseWritable":"ok","eventLoop":"ok"},"timestamp":…}` or `503` with the failing check named.
+
+### `GET /openapi.json` (v4.3)
+Unauthenticated **OpenAPI 3.1** description of the whole REST + A2A surface. The spec is generated per request by walking the live Express router stack, so it always matches the routes the running server actually registered. The API-key scheme is declared as `components.securitySchemes.meshApiKey` (`apiKey`, header `X-API-Key`).
+
+### `GET /api/debug/routes` (v4.3)
+Authenticated. Returns the same live route inventory the OpenAPI generator uses: `{count, routes: [{method, path}]}`. Exists so tests can assert the spec is honest (every registered route appears in `/openapi.json`).
 
 ### `GET /api/health`
 Authenticated, OpenClaw-friendly health summary: `status`, `version`, `totalAgents`, `healthy`, `degraded`, `unhealthy`, `activeCatastrophes`, `websocketClients`, `timestamp`.
@@ -530,6 +557,23 @@ Optional decentralized P2P file transfer. Requires the Phantom CLI and the Retic
 
 ---
 
+## A2A (Agent2Agent) Interface (v4.3)
+
+The mesh speaks A2A in two profiles. **1.0 is the primary profile**; 0.3 is a compatibility profile for legacy clients. The two are *not* wire-compatible, so they live on separate URLs and both are listed in the Agent Card. Auth is the mesh API key (HTTP 401 on failure — auth errors are not JSON-RPC errors). Streaming and push notifications are **not** supported and are not advertised.
+
+### `GET /.well-known/agent-card.json`
+Unauthenticated. A2A 1.0 Agent Card: `name`, `description`, `supportedInterfaces` (`{url, protocolBinding: "HTTP+JSON", protocolVersion}` for `1.0` at `/a2a` and `0.3` at `/a2a/v0.3`), `version` (the server version), `capabilities: {streaming: false, pushNotifications: false, extendedAgentCard: false}`, `securitySchemes.meshApiKey` (1.0 `apiKeySecurityScheme`, header `X-API-Key`), `securityRequirements`, `defaultInputModes`/`defaultOutputModes` (`text/plain`, `application/json`), and `skills` derived from real mesh capabilities: `agent-messaging`, `group-broadcast`, `shared-memory`, `decision-voting`, `agent-discovery`. Served with `Cache-Control: max-age=300`.
+
+### `POST /a2a` — A2A 1.0 (JSON-RPC 2.0)
+Methods: `SendMessage`, `GetTask`. Anything else → JSON-RPC `-32601`.
+
+`SendMessage` — `params.message` is a 1.0 Message: `{messageId, role: "ROLE_USER", parts: [{text, mediaType: "text/plain"}], metadata?: {toAgent}}`. The text part becomes a real mesh message to the agent named by `metadata.toAgent` (name or ID), or a broadcast to every registered agent when no target is named. The sender is recorded as `a2a-gateway`, and the usual WebSocket message events fire. The result wraps a Task: `{result: {task: {id, contextId, status: {state: "TASK_STATE_COMPLETED", timestamp}, history: [the message], artifacts: [{name: "delivery", parts: [{text: "Delivered to …"}]}], metadata: {messageIds}}}}`. An unknown target agent → `-32602`; a message with no text part → `-32602`.
+
+`GetTask` — `params: {id}` returns `{result: {task}}` for a task previously returned by `SendMessage` (tasks persist in the `a2a_tasks` table). Unknown id → error `-32001` "Task not found" with 1.0-style `data: [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "TASK_NOT_FOUND"}]`.
+
+### `POST /a2a/v0.3` — A2A 0.3 compatibility profile
+Same core, 0.3 shapes. Methods: `message/send`, `tasks/get`. Messages use lowercase `role: "user"`, `kind: "message"`, and parts discriminated by `kind` (`{kind: "text", text}`). The Task is the **direct** `result` (no `{task}` wrapper), carries `kind: "task"`, and its state is lowercase `completed`. Unknown task → `-32001` "Task not found" (no `data` payload, per the 0.3 mapping).
+
 ## WebSocket Events
 
 Connect to `ws://localhost:4000/ws`. On connect the server sends:
@@ -558,7 +602,7 @@ Connect to `ws://localhost:4000/ws`. On connect the server sends:
 
 ## Environment Variables
 
-Server: `PORT` (4000), `AGENT_MESH_API_KEY`, `AGENT_MESH_DB_PATH` (`./agent-mesh.db`), `AGENT_MESH_BODY_LIMIT` (`12mb`), `AGENT_MESH_OFFLINE_MINUTES` (5), `MESSAGE_TIMEOUT` (300000), `MESSAGE_TIMEOUT_CHECK_INTERVAL_MS` (60000), `SCHEDULED_MESSAGE_CHECK_INTERVAL_MS` (15000). Client variables are listed in `.env.example` and the README's Configuration section. Node 24 can load a `.env` file without extra dependencies: `node --env-file=.env server.js`.
+Server: `PORT` (4000), `AGENT_MESH_API_KEY`, `AGENT_MESH_DB_PATH` (`./agent-mesh.db`), `AGENT_MESH_BODY_LIMIT` (`12mb`), `AGENT_MESH_OFFLINE_MINUTES` (5), `MESSAGE_TIMEOUT` (300000), `MESSAGE_TIMEOUT_CHECK_INTERVAL_MS` (60000), `SCHEDULED_MESSAGE_CHECK_INTERVAL_MS` (15000), `AGENT_MESH_RATE_LIMIT_MAX` (300), `AGENT_MESH_RATE_LIMIT_WINDOW_MS` (60000), `AGENT_MESH_LOG_FORMAT` (default; `json` | `pretty` | `off`). Client variables are listed in `.env.example` and the README's Configuration section. Node 24 can load a `.env` file without extra dependencies: `node --env-file=.env server.js`.
 
 ## Database Migration
 
@@ -568,10 +612,12 @@ Existing databases are migrated in place on server boot (new tables/columns are 
 node migrate-db.js
 ```
 
-## Known Limitations (4.2.0)
+## Known Limitations (4.3.0)
 
 1. **`GET /api/updates` returns snake_case** raw rows (`payload_url`, `update_type`, …) while the `system_update` broadcast is camelCase (see System Updates).
 2. **No single-update GET** — `GET /api/updates/:id` does not exist; select from the list.
-3. **Shared-key auth only** — one API key for the whole mesh; no per-agent credentials.
+3. **Keys are mesh-wide, not per-agent** — any valid key can act as any agent (v4.3 adds hashed storage, multiple issuable keys and revocation, but not per-agent scopes).
+4. **A2A subset** — only `SendMessage`/`GetTask` (1.0) and `message/send`/`tasks/get` (0.3); no streaming, push notifications, task cancel/list, or extended agent card, and none are advertised in the card.
+5. **Rate-limit buckets are in-memory** — they reset on restart and are not shared across processes.
 
 *Resolved in 4.2.0 (previously listed here): reactions can now be removed (`DELETE /api/messages/:id/reactions`); decisions are persisted records with a full voting lifecycle, and `GET /api/decisions` returns decision records instead of activity rows; scheduled-message status is readable via `GET /api/messages/scheduled/:id` and the `?status=` list filter; the MCP sub-README's stale 5-tool list was replaced with the verified 16-tool list.*
